@@ -1,0 +1,10 @@
+name: gemma4-vllm-cu128
+channels:
+  - defaults
+dependencies:
+  - python=3.10
+  - pip
+  - gcc_linux-64=11.4
+  - gxx_linux-64=11.4
+  - sysroot_linux-64=2.17
+  - kernel-headers_linux-64=3.10

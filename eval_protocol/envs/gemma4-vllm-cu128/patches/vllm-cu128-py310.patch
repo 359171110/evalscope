@@ -1,0 +1,960 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d956e29..8d3128a 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -115,19 +115,21 @@ endif()
+ # This extension requires SABI 3.11 since it relies on Py_buffer support. Loading
+ # failure is handled gracefully on vLLM side for lower Python versions.
+ #
+-set(VLLM_SPINLOOP_EXT_SRC "csrc/spinloop.cpp")
+-set(SPINLOOP_COMPILE_FLAGS "")
+-if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
+-  list(APPEND SPINLOOP_COMPILE_FLAGS "-mmwaitx")
++if(Python_VERSION VERSION_GREATER_EQUAL 3.11)
++  set(VLLM_SPINLOOP_EXT_SRC "csrc/spinloop.cpp")
++  set(SPINLOOP_COMPILE_FLAGS "")
++  if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64")
++    list(APPEND SPINLOOP_COMPILE_FLAGS "-mmwaitx")
++  endif()
++  define_extension_target(
++    spinloop
++    DESTINATION vllm
++    LANGUAGE CXX
++    SOURCES ${VLLM_SPINLOOP_EXT_SRC}
++    COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
++    USE_SABI 3.11
++    WITH_SOABI)
+ endif()
+-define_extension_target(
+-  spinloop
+-  DESTINATION vllm
+-  LANGUAGE CXX
+-  SOURCES ${VLLM_SPINLOOP_EXT_SRC}
+-  COMPILE_FLAGS ${SPINLOOP_COMPILE_FLAGS}
+-  USE_SABI 3.11
+-  WITH_SOABI)
+ 
+ #
+ # Forward the non-CUDA device extensions to external CMake scripts.
+@@ -310,6 +312,8 @@ set(VLLM_EXT_SRC
+   "csrc/quantization/activation_kernels.cu"
+   "csrc/torch_bindings.cpp")
+ 
++list(APPEND VLLM_EXT_SRC "csrc/glibc_compat.cpp")
++
+ if(VLLM_GPU_LANG STREQUAL "CUDA")
+   SET(CUTLASS_ENABLE_HEADERS_ONLY ON CACHE BOOL "Enable only the header library")
+ 
+@@ -624,6 +628,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
+   #
+   set(VLLM_STABLE_EXT_SRC
+     "csrc/libtorch_stable/torch_bindings.cpp"
++    "csrc/glibc_compat.cpp"
+     "csrc/libtorch_stable/activation_kernels.cu"
+     "csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu"
+     "csrc/libtorch_stable/quantization/w8a8/fp8/common.cu"
+@@ -1120,6 +1125,7 @@ endif()
+ 
+ set(VLLM_MOE_EXT_SRC
+   "csrc/moe/torch_bindings.cpp"
++    "csrc/glibc_compat.cpp"
+   "csrc/moe/moe_align_sum_kernels.cu"
+   "csrc/moe/topk_softmax_kernels.cu"
+   "csrc/moe/topk_softplus_sqrt_kernels.cu")
+diff --git a/pyproject.toml b/pyproject.toml
+index c782cc3..0dea2d6 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -7,7 +7,6 @@ requires = [
+     "setuptools>=77.0.3,<81.0.0",
+     "setuptools-scm>=8.0",
+     "setuptools-rust>=1.9.0",
+-    "torch == 2.11.0",
+     "wheel",
+     "jinja2",
+ ]
+@@ -186,4 +185,3 @@ WHT = "WHT"
+ CANN = "CANN"
+ 
+ [tool.uv]
+-no-build-isolation-package = ["torch"]
+diff --git a/requirements/build/cpu.txt b/requirements/build/cpu.txt
+index 640432d..c84d12a 100644
+--- a/requirements/build/cpu.txt
++++ b/requirements/build/cpu.txt
+@@ -1,12 +1,9 @@
+---extra-index-url https://download.pytorch.org/whl/cpu
+ cmake>=3.26.1
+ ninja
+ packaging>=24.2
+ setuptools==77.0.3 # this version can reuse CMake build dir
+ setuptools-scm>=8
+ setuptools-rust>=1.9.0
+-torch==2.11.0+cpu; platform_machine == "x86_64" or platform_machine == "s390x" or platform_machine == "aarch64"
+-torch==2.11.0; platform_system == "Darwin" or platform_machine == "ppc64le"  or platform_machine == "riscv64"
+ wheel
+ jinja2>=3.1.6
+ regex
+diff --git a/requirements/build/cuda.txt b/requirements/build/cuda.txt
+index 70da484..5f36da6 100644
+--- a/requirements/build/cuda.txt
++++ b/requirements/build/cuda.txt
+@@ -5,7 +5,6 @@ packaging>=24.2
+ setuptools>=77.0.3,<81.0.0
+ setuptools-scm>=8
+ setuptools-rust>=1.9.0
+-torch==2.11.0
+ wheel
+ jinja2>=3.1.6
+ regex
+diff --git a/requirements/build/rocm.txt b/requirements/build/rocm.txt
+index e09bdc0..80cffec 100644
+--- a/requirements/build/rocm.txt
++++ b/requirements/build/rocm.txt
+@@ -2,10 +2,6 @@
+ -r ../common.txt
+ 
+ 
+---extra-index-url https://download.pytorch.org/whl/rocm7.1
+-torch==2.11.0
+-torchvision==0.26.0
+-torchaudio==2.11.0
+ triton==3.6.0
+ cmake>=3.26.1,<4
+ packaging>=24.2
+diff --git a/requirements/build/tpu.txt b/requirements/build/tpu.txt
+index 56348e7..7f8c6c5 100644
+--- a/requirements/build/tpu.txt
++++ b/requirements/build/tpu.txt
+@@ -1,8 +1,6 @@
+---extra-index-url https://download.pytorch.org/whl/cpu
+ cmake>=3.26.1
+ ninja
+ setuptools>=77.0.3,<81.0.0
+ setuptools-scm>=8
+ setuptools-rust>=1.9.0
+-torch==2.11.0+cpu
+ wheel
+diff --git a/requirements/cpu.txt b/requirements/cpu.txt
+index 5ec338a..ad26d1d 100644
+--- a/requirements/cpu.txt
++++ b/requirements/cpu.txt
+@@ -1,4 +1,3 @@
+---extra-index-url https://download.pytorch.org/whl/cpu
+ # Common dependencies
+ -r common.txt
+ 
+@@ -7,16 +6,9 @@ setuptools==77.0.3 # this version can reuse CMake build dir
+ numba == 0.65.0; platform_machine != "s390x" # Required for N-gram speculative decoding
+ 
+ # Dependencies for CPUs
+-torch==2.11.0+cpu; platform_machine == "x86_64" or platform_machine == "s390x" or platform_machine == "aarch64"
+-torch==2.11.0; platform_system == "Darwin" or platform_machine == "ppc64le" or platform_machine == "riscv64"
+ 
+-# required for the image processor of minicpm-o-2_6, this must be updated alongside torch
+-torchaudio; platform_machine != "s390x" and platform_machine != "riscv64"
+ 
+-# required for the image processor of phi3v, this must be updated alongside torch
+-torchvision; platform_machine != "s390x"  and platform_machine != "riscv64"
+ 
+-# Intel Extension for PyTorch, only for x86_64 CPUs
+ intel-openmp==2024.2.1; platform_machine == "x86_64"
+ 
+ # Use this to gather CPU info and optimize based on ARM Neoverse cores
+diff --git a/requirements/cuda.txt b/requirements/cuda.txt
+index 89be67b..2c9d542 100644
+--- a/requirements/cuda.txt
++++ b/requirements/cuda.txt
+@@ -4,10 +4,6 @@
+ numba == 0.65.0 # Required for N-gram speculative decoding
+ 
+ # Dependencies for NVIDIA GPUs
+-torch==2.11.0
+-torchaudio==2.11.0
+-# These must be updated alongside torch
+-torchvision==0.26.0 # Required for phi3v processor. See https://github.com/pytorch/vision?tab=readme-ov-file#installation for corresponding version
+ # FlashInfer should be updated together with the Dockerfile
+ flashinfer-python==0.6.12
+ flashinfer-cubin==0.6.12
+diff --git a/requirements/test/cuda.in b/requirements/test/cuda.in
+index 8d7ad7d..269c0f5 100644
+--- a/requirements/test/cuda.in
++++ b/requirements/test/cuda.in
+@@ -16,7 +16,6 @@ blobfile # required for kimi-vl test
+ einops # required for MPT, qwen-vl
+ httpx
+ librosa # required for audio tests
+-vector_quantize_pytorch # required for minicpmo_26 test
+ vocos # required for minicpmo_26 test
+ peft>=0.18.1 # required for phi-4-mm test
+ pqdm
+@@ -26,14 +25,10 @@ soundfile # required for audio tests
+ jiwer # required for audio tests
+ tblib # for pickling test exceptions
+ timm >=1.0.17 # required for internvl and gemma3n-mm test
+-torch==2.11.0
+-torchaudio==2.11.0
+-torchvision==0.26.0
+ transformers_stream_generator # required for qwen-vl test
+ matplotlib # required for qwen-vl test
+ mistral_common[image,audio] >= 1.11.3 # required for voxtral test
+ num2words # required for smolvlm test
+-open_clip_torch==2.32.0 # Required for nemotron_vl test, Nemotron Parse in test_common.py
+ opencv-python-headless >= 4.13.0 # required for video test
+ datamodel_code_generator # required for minicpm3 test
+ lm-eval[api]>=0.4.12 # required for model evaluation test
+@@ -61,21 +56,15 @@ fastsafetensors>=0.3.2
+ instanttensor>=0.1.5; platform_machine == "x86_64"
+ pydantic>=2.12 # 2.11 leads to error on python 3.13
+ decord==0.6.0; platform_machine == "x86_64"
+-# terratorch is temporarily disabled while PyPI has the `lightning` package
+-# in `quarantined` status (every published terratorch version transitively
+ # requires `lightning`, so the resolver fails with "no versions of lightning").
+ # Re-enable once PyPI lifts the quarantine. Tracked in #41376.
+-# terratorch >= 1.2.2 # Required for Prithvi tests
+ imagehash # Required for Prithvi tests
+-segmentation-models-pytorch > 0.4.0 # Required for Prithvi tests
+ 
+ gpt-oss >= 0.0.7; python_version > '3.11'
+ 
+ perceptron # required for isaac test
+ kaldi-native-fbank >= 1.18.7 # required for fireredasr2 test
+ 
+-# Newer versions of datasets require torchcoded, that makes the tests fail in CI because of a missing library.
+-# Older versions are in conflict with teerratorch requirements.
+ datasets>=3.3.0,<=3.6.0
+ 
+ openpyxl # required for perf comparison excel report
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index a3e1466..9854326 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -1,5 +1,4 @@
+ # This file was autogenerated by uv via the following command:
+-#    uv pip compile requirements/test/cuda.in -c requirements/cuda.txt -o requirements/test/cuda.txt --index-strategy unsafe-best-match --torch-backend cu130 --python-platform x86_64-manylinux_2_28 --python-version 3.12
+ absl-py==2.1.0
+     # via rouge-score
+ accelerate==1.13.0
+@@ -128,11 +127,9 @@ cryptography==46.0.5
+     #   msal
+     #   pyjwt
+ cuda-bindings==13.0.3
+-    # via torch
+ cuda-pathfinder==1.3.3
+     # via cuda-bindings
+ cuda-toolkit==13.0.2
+-    # via torch
+ cupy-cuda12x==13.6.0
+     # via ray
+ cycler==0.12.1
+@@ -171,10 +168,8 @@ einops==0.8.1
+     # via
+     #   -r requirements/test/cuda.in
+     #   encodec
+-    #   vector-quantize-pytorch
+     #   vocos
+ einx==0.3.0
+-    # via vector-quantize-pytorch
+ email-validator==2.2.0
+     # via pydantic
+ encodec==0.1.1
+@@ -202,7 +197,6 @@ filelock==3.16.1
+     #   datasets
+     #   huggingface-hub
+     #   ray
+-    #   torch
+     #   virtualenv
+ fonttools==4.55.0
+     # via matplotlib
+@@ -220,9 +214,7 @@ fsspec==2024.12.0
+     #   evaluate
+     #   fastparquet
+     #   huggingface-hub
+-    #   torch
+ ftfy==6.3.1
+-    # via open-clip-torch
+ genai-perf==0.0.16
+     # via -r requirements/test/cuda.in
+ genson==1.3.0
+@@ -292,9 +284,7 @@ huggingface-hub==1.10.2
+     #   accelerate
+     #   datasets
+     #   evaluate
+-    #   open-clip-torch
+     #   peft
+-    #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   timm
+     #   tokenizers
+@@ -344,7 +334,6 @@ jinja2==3.1.6
+     #   datamodel-code-generator
+     #   genai-perf
+     #   lm-eval
+-    #   torch
+ jiwer==3.0.5
+     # via -r requirements/test/cuda.in
+ jmespath==1.0.1
+@@ -442,7 +431,6 @@ mypy-extensions==1.0.0
+ networkx==3.2.1
+     # via
+     #   scikit-image
+-    #   torch
+ nltk==3.9.1
+     # via rouge-score
+ num2words==0.5.14
+@@ -489,12 +477,10 @@ numpy==2.2.6
+     #   scikit-image
+     #   scikit-learn
+     #   scipy
+-    #   segmentation-models-pytorch
+     #   soxr
+     #   statsmodels
+     #   tensorizer
+     #   tifffile
+-    #   torchvision
+     #   transformers
+     #   tritonclient
+     #   vocos
+@@ -510,7 +496,6 @@ nvidia-cuda-nvrtc==13.0.88
+ nvidia-cuda-runtime==13.0.96
+     # via cuda-toolkit
+ nvidia-cudnn-cu13==9.19.0.56
+-    # via torch
+ nvidia-cufft==12.0.0.61
+     # via cuda-toolkit
+ nvidia-cufile==1.15.1.6
+@@ -524,9 +509,7 @@ nvidia-cusparse==12.6.3.3
+     #   cuda-toolkit
+     #   nvidia-cusolver
+ nvidia-cusparselt-cu13==0.8.0
+-    # via torch
+ nvidia-nccl-cu13==2.28.9
+-    # via torch
+ nvidia-nvjitlink==13.0.88
+     # via
+     #   cuda-toolkit
+@@ -534,10 +517,8 @@ nvidia-nvjitlink==13.0.88
+     #   nvidia-cusolver
+     #   nvidia-cusparse
+ nvidia-nvshmem-cu13==3.4.5
+-    # via torch
+ nvidia-nvtx==13.0.85
+     # via cuda-toolkit
+-open-clip-torch==2.32.0
+     # via -r requirements/test/cuda.in
+ openai-harmony==0.0.4
+     # via
+@@ -627,8 +608,6 @@ pillow==10.4.0
+     #   mistral-common
+     #   perceptron
+     #   scikit-image
+-    #   segmentation-models-pytorch
+-    #   torchvision
+ platformdirs==4.3.6
+     # via
+     #   black
+@@ -801,7 +780,6 @@ referencing==0.35.1
+ regex==2026.2.28
+     # via
+     #   nltk
+-    #   open-clip-torch
+     #   sacrebleu
+     #   tiktoken
+     #   transformers
+@@ -862,9 +840,7 @@ safetensors==0.7.0
+     # via
+     #   -c requirements/common.txt
+     #   accelerate
+-    #   open-clip-torch
+     #   peft
+-    #   segmentation-models-pytorch
+     #   timm
+     #   transformers
+ schemathesis==3.39.15
+@@ -890,7 +866,6 @@ scipy==1.13.1
+     #   sentence-transformers
+     #   statsmodels
+     #   vocos
+-segmentation-models-pytorch==0.5.0
+     # via -r requirements/test/cuda.in
+ sentence-transformers==5.2.0
+     # via
+@@ -900,7 +875,6 @@ setuptools==77.0.3
+     # via
+     #   -c requirements/common.txt
+     #   pytablewriter
+-    #   torch
+ shellingham==1.5.4
+     # via
+     #   perceptron
+@@ -951,7 +925,6 @@ structlog==25.4.0
+ sympy==1.13.3
+     # via
+     #   einx
+-    #   torch
+ tabledata==1.3.3
+     # via pytablewriter
+ tabulate==0.9.0
+@@ -982,8 +955,6 @@ tiktoken==0.12.0
+ timm==1.0.17
+     # via
+     #   -r requirements/test/cuda.in
+-    #   open-clip-torch
+-    #   segmentation-models-pytorch
+ tokenizers==0.22.2
+     # via
+     #   -c requirements/common.txt
+@@ -993,7 +964,6 @@ tomli==2.2.1
+     # via schemathesis
+ tomli-w==1.2.0
+     # via schemathesis
+-torch==2.11.0+cu130
+     # via
+     #   -c requirements/cuda.txt
+     #   -r requirements/test/cuda.in
+@@ -1002,28 +972,20 @@ torch==2.11.0+cu130
+     #   encodec
+     #   instanttensor
+     #   mteb
+-    #   open-clip-torch
+     #   peft
+     #   runai-model-streamer
+-    #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   tensorizer
+     #   timm
+-    #   torchvision
+-    #   vector-quantize-pytorch
+     #   vocos
+-torchaudio==2.11.0+cu130
+     # via
+     #   -c requirements/cuda.txt
+     #   -r requirements/test/cuda.in
+     #   encodec
+     #   vocos
+-torchvision==0.26.0+cu130
+     # via
+     #   -c requirements/cuda.txt
+     #   -r requirements/test/cuda.in
+-    #   open-clip-torch
+-    #   segmentation-models-pytorch
+     #   timm
+ tqdm==4.67.3
+     # via
+@@ -1033,11 +995,9 @@ tqdm==4.67.3
+     #   lm-eval
+     #   mteb
+     #   nltk
+-    #   open-clip-torch
+     #   optuna
+     #   peft
+     #   pqdm
+-    #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   transformers
+ transformers==5.5.3
+@@ -1051,7 +1011,6 @@ transformers==5.5.3
+ transformers-stream-generator==0.0.5
+     # via -r requirements/test/cuda.in
+ triton==3.6.0
+-    # via torch
+ tritonclient==2.64.0
+     # via -r requirements/test/cuda.in
+ typepy==1.3.2
+@@ -1094,7 +1053,6 @@ typing-extensions==4.15.0
+     #   sentence-transformers
+     #   sqlalchemy
+     #   starlette
+-    #   torch
+     #   typer
+     #   typing-inspection
+ typing-inspection==0.4.2
+@@ -1113,7 +1071,6 @@ urllib3==2.2.3
+     #   tritonclient
+ uvicorn==0.35.0
+     # via gpt-oss
+-vector-quantize-pytorch==1.21.2
+     # via -r requirements/test/cuda.in
+ virtualenv==20.31.2
+     # via ray
+diff --git a/requirements/test/rocm.in b/requirements/test/rocm.in
+index ed10270..3c9bb68 100644
+--- a/requirements/test/rocm.in
++++ b/requirements/test/rocm.in
+@@ -18,7 +18,6 @@ blobfile # required for kimi-vl test
+ einops # required for MPT, qwen-vl
+ httpx
+ librosa # required for audio tests
+-vector_quantize_pytorch # required for minicpmo_26 test
+ vocos # required for minicpmo_26 test
+ peft>=0.15.0 # required for phi-4-mm test
+ pqdm
+@@ -32,7 +31,6 @@ transformers_stream_generator # required for qwen-vl test
+ matplotlib # required for qwen-vl test
+ mistral_common[image,audio]>=1.11.3 # required for voxtral test
+ num2words # required for smolvlm test
+-open_clip_torch==2.32.0 # Required for nemotron_vl test, Nemotron Parse in test_common.py
+ opencv-python-headless>=4.13.0 # required for video test
+ datamodel_code_generator # required for minicpm3 test
+ lm-eval[api]>=0.4.12 # required for model evaluation test
+@@ -62,21 +60,15 @@ pydantic>=2.12 # 2.11 leads to error on python 3.13
+ decord==0.6.0
+ 
+ # Prithvi tests
+-# terratorch is temporarily disabled while PyPI has the `lightning` package
+-# in `quarantined` status (every published terratorch version transitively
+ # requires `lightning`, so the resolver fails with "no versions of lightning").
+ # Re-enable once PyPI lifts the quarantine. Tracked in #41376.
+-# terratorch>=1.2.2
+ imagehash # Required for Prithvi tests
+-segmentation-models-pytorch>0.4.0 # Required for Prithvi tests
+ 
+ gpt-oss>=0.0.7; python_version > '3.11'
+ 
+ perceptron # required for isaac test
+ kaldi-native-fbank>=1.18.7 # required for fireredasr2 test
+ 
+-# Newer versions of datasets require torchcoded, that makes the tests fail in CI because of a missing library.
+-# Older versions are in conflict with terratorch requirements.
+ datasets>=3.3.0,<=3.6.0
+ 
+ openpyxl # required for perf comparison excel report
+@@ -84,7 +76,4 @@ plotly # required for perf comparison html report
+ 
+ # ROCm-specific extras (not in CUDA cuda.in)
+ rapidfuzz
+-# torchgeo also pulled in `lightning` transitively; disabled for the same
+-# quarantine reason as terratorch above. Restore once the quarantine clears.
+-# torchgeo==0.7.0
+ multiprocess==0.70.16
+diff --git a/requirements/test/rocm.txt b/requirements/test/rocm.txt
+index ce18ce4..b1c8d4a 100644
+--- a/requirements/test/rocm.txt
++++ b/requirements/test/rocm.txt
+@@ -1,5 +1,4 @@
+ # This file was autogenerated by uv via the following command:
+-#    uv pip compile requirements/test/rocm.in -c requirements/rocm.txt -o requirements/test/rocm.txt --index-strategy unsafe-best-match --python-platform x86_64-manylinux_2_28 --python-version 3.12 --no-emit-package torch --no-emit-package torchvision --no-emit-package torchaudio --no-emit-package triton --no-emit-package cuda-bindings --no-emit-package cuda-pathfinder --no-emit-package cuda-toolkit --no-emit-package cupy-cuda12x --no-emit-package nvidia-cublas --no-emit-package nvidia-cuda-cupti --no-emit-package nvidia-cuda-nvrtc --no-emit-package nvidia-cuda-runtime --no-emit-package nvidia-cudnn --no-emit-package nvidia-cufft --no-emit-package nvidia-cufile --no-emit-package nvidia-curand --no-emit-package nvidia-cusolver --no-emit-package nvidia-cusparse --no-emit-package nvidia-cusparselt --no-emit-package nvidia-nccl --no-emit-package nvidia-nvjitlink --no-emit-package nvidia-nvshmem --no-emit-package nvidia-nvtx --no-emit-package nvidia-cublas-cu12 --no-emit-package nvidia-cuda-cupti-cu12 --no-emit-package nvidia-cuda-nvrtc-cu12 --no-emit-package nvidia-cuda-runtime-cu12 --no-emit-package nvidia-cudnn-cu12 --no-emit-package nvidia-cufft-cu12 --no-emit-package nvidia-cufile-cu12 --no-emit-package nvidia-curand-cu12 --no-emit-package nvidia-cusolver-cu12 --no-emit-package nvidia-cusparse-cu12 --no-emit-package nvidia-cusparselt-cu12 --no-emit-package nvidia-nccl-cu12 --no-emit-package nvidia-nvjitlink-cu12 --no-emit-package nvidia-nvshmem-cu12 --no-emit-package nvidia-nvtx-cu12 --no-emit-package nvidia-cublas-cu13 --no-emit-package nvidia-cuda-cupti-cu13 --no-emit-package nvidia-cuda-nvrtc-cu13 --no-emit-package nvidia-cuda-runtime-cu13 --no-emit-package nvidia-cudnn-cu13 --no-emit-package nvidia-cufft-cu13 --no-emit-package nvidia-cufile-cu13 --no-emit-package nvidia-curand-cu13 --no-emit-package nvidia-cusolver-cu13 --no-emit-package nvidia-cusparse-cu13 --no-emit-package nvidia-cusparselt-cu13 --no-emit-package nvidia-nccl-cu13 --no-emit-package nvidia-nvjitlink-cu13 --no-emit-package nvidia-nvshmem-cu13 --no-emit-package nvidia-nvtx-cu13
+ absl-py==2.4.0
+     # via rouge-score
+ accelerate==1.13.0
+@@ -213,10 +212,8 @@ einops==0.8.2
+     #   -r requirements/test/../common.txt
+     #   -r requirements/test/rocm.in
+     #   encodec
+-    #   vector-quantize-pytorch
+     #   vocos
+ einx==0.4.2
+-    # via vector-quantize-pytorch
+ email-validator==2.3.0
+     # via
+     #   fastapi
+@@ -254,7 +251,6 @@ filelock==3.25.2
+     #   huggingface-hub
+     #   python-discovery
+     #   ray
+-    #   torch
+     #   virtualenv
+ fonttools==4.62.1
+     # via matplotlib
+@@ -272,9 +268,7 @@ fsspec==2025.3.0
+     #   evaluate
+     #   fastparquet
+     #   huggingface-hub
+-    #   torch
+ ftfy==6.3.1
+-    # via open-clip-torch
+ genai-perf==0.0.16
+     # via -r requirements/test/rocm.in
+ genson==1.3.0
+@@ -365,9 +359,7 @@ huggingface-hub==1.10.2
+     #   accelerate
+     #   datasets
+     #   evaluate
+-    #   open-clip-torch
+     #   peft
+-    #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   timm
+     #   tokenizers
+@@ -422,7 +414,6 @@ jinja2==3.1.6
+     #   fastapi
+     #   genai-perf
+     #   lm-eval
+-    #   torch
+ jiter==0.14.0
+     # via
+     #   anthropic
+@@ -560,7 +551,6 @@ narwhals==2.18.0
+ networkx==3.6.1
+     # via
+     #   scikit-image
+-    #   torch
+ ninja==1.13.0
+     # via -r requirements/test/../common.txt
+ nltk==3.9.3
+@@ -613,7 +603,6 @@ numpy==2.2.6
+     #   scikit-image
+     #   scikit-learn
+     #   scipy
+-    #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   soundfile
+     #   soxr
+@@ -621,12 +610,10 @@ numpy==2.2.6
+     #   tensorizer
+     #   tifffile
+     #   tilelang
+-    #   torchvision
+     #   transformers
+     #   tritonclient
+     #   vocos
+     #   xgrammar
+-open-clip-torch==2.32.0
+     # via -r requirements/test/rocm.in
+ openai==2.31.0
+     # via
+@@ -762,8 +749,6 @@ pillow==12.1.1
+     #   mistral-common
+     #   perceptron
+     #   scikit-image
+-    #   segmentation-models-pytorch
+-    #   torchvision
+ platformdirs==4.3.6
+     # via
+     #   black
+@@ -991,7 +976,6 @@ regex==2026.2.28
+     # via
+     #   -r requirements/test/../common.txt
+     #   nltk
+-    #   open-clip-torch
+     #   sacrebleu
+     #   tiktoken
+     #   transformers
+@@ -1063,9 +1047,7 @@ safetensors==0.7.0
+     #   -c requirements/common.txt
+     #   -r requirements/test/../common.txt
+     #   accelerate
+-    #   open-clip-torch
+     #   peft
+-    #   segmentation-models-pytorch
+     #   timm
+     #   transformers
+ schemathesis==3.39.15
+@@ -1092,7 +1074,6 @@ scipy==1.17.1
+     #   sentence-transformers
+     #   statsmodels
+     #   vocos
+-segmentation-models-pytorch==0.5.0
+     # via -r requirements/test/rocm.in
+ sentence-transformers==5.3.0
+     # via
+@@ -1111,7 +1092,6 @@ setuptools==79.0.1
+     #   -r requirements/test/../common.txt
+     #   model-hosting-container-standards
+     #   pytablewriter
+-    #   torch
+ shellingham==1.5.4
+     # via
+     #   perceptron
+@@ -1174,7 +1154,6 @@ supervisor==4.3.0
+ sympy==1.14.0
+     # via
+     #   einx
+-    #   torch
+ tabledata==1.3.4
+     # via pytablewriter
+ tabulate==0.10.0
+@@ -1212,8 +1191,6 @@ timm==1.0.17
+     # via
+     #   -c requirements/rocm.txt
+     #   -r requirements/test/rocm.in
+-    #   open-clip-torch
+-    #   segmentation-models-pytorch
+ tokenizers==0.22.2
+     # via
+     #   -c requirements/common.txt
+@@ -1224,7 +1201,6 @@ tomli==2.4.0
+     # via schemathesis
+ tomli-w==1.2.0
+     # via schemathesis
+-torch-c-dlpack-ext==0.1.5
+     # via tilelang
+ tqdm==4.67.3
+     # via
+@@ -1236,12 +1212,10 @@ tqdm==4.67.3
+     #   lm-eval
+     #   mteb
+     #   nltk
+-    #   open-clip-torch
+     #   openai
+     #   optuna
+     #   peft
+     #   pqdm
+-    #   segmentation-models-pytorch
+     #   sentence-transformers
+     #   tilelang
+     #   transformers
+@@ -1313,7 +1287,6 @@ typing-extensions==4.15.0
+     #   sqlalchemy
+     #   starlette
+     #   tilelang
+-    #   torch
+     #   typeguard
+     #   typing-inspection
+     #   xgrammar
+@@ -1345,7 +1318,6 @@ uvicorn==0.42.0
+     #   mcp
+ uvloop==0.22.1
+     # via uvicorn
+-vector-quantize-pytorch==1.28.0
+     # via -r requirements/test/rocm.in
+ virtualenv==21.2.0
+     # via ray
+@@ -1385,9 +1357,6 @@ zipp==3.23.0
+     # via importlib-metadata
+ 
+ # The following packages were excluded from the output:
+-# torch
+-# torchvision
+-# torchaudio
+ # triton
+ # cuda-bindings
+ # cuda-pathfinder
+diff --git a/requirements/test/xpu.txt b/requirements/test/xpu.txt
+index 6242ff4..fa978b8 100644
+--- a/requirements/test/xpu.txt
++++ b/requirements/test/xpu.txt
+@@ -1,5 +1,4 @@
+ # This file was autogenerated by uv via the following command:
+-#    uv pip compile requirements/test/xpu.in -c requirements/xpu.txt -o requirements/test/xpu.txt --index-strategy unsafe-best-match --torch-backend xpu --python-platform x86_64-manylinux_2_39 --python-version 3.12
+ absl-py==2.4.0
+     # via
+     #   -r requirements/test/xpu.in
+@@ -100,7 +99,6 @@ dpcpp-cpp-rt==2025.3.2
+     #   onemkl-sycl-lapack
+     #   onemkl-sycl-rng
+     #   onemkl-sycl-sparse
+-    #   torch
+ evaluate==0.4.6
+     # via lm-eval
+ fastapi==0.135.2
+@@ -114,7 +112,6 @@ filelock==3.25.2
+     #   datasets
+     #   huggingface-hub
+     #   modelscope
+-    #   torch
+ frozenlist==1.8.0
+     # via
+     #   aiohttp
+@@ -124,7 +121,6 @@ fsspec==2026.2.0
+     #   datasets
+     #   evaluate
+     #   huggingface-hub
+-    #   torch
+ gpt-oss==0.0.8
+     # via -r requirements/test/xpu.in
+ graphql-core==3.2.8
+@@ -175,23 +171,19 @@ imageio==2.37.3
+ impi-rt==2021.17.2
+     # via
+     #   oneccl
+-    #   torch
+ iniconfig==2.3.0
+     # via pytest
+ intel-cmplr-lib-rt==2025.3.2
+     # via
+     #   intel-sycl-rt
+-    #   torch
+ intel-cmplr-lib-ur==2025.3.2
+     # via
+     #   intel-openmp
+     #   intel-sycl-rt
+-    #   torch
+ intel-cmplr-lic-rt==2025.3.2
+     # via
+     #   intel-opencl-rt
+     #   intel-sycl-rt
+-    #   torch
+ intel-opencl-rt==2025.3.2
+     # via
+     #   dpcpp-cpp-rt
+@@ -200,24 +192,19 @@ intel-opencl-rt==2025.3.2
+     #   onemkl-sycl-lapack
+     #   onemkl-sycl-rng
+     #   onemkl-sycl-sparse
+-    #   torch
+ intel-openmp==2025.3.2
+     # via
+     #   dpcpp-cpp-rt
+     #   mkl
+-    #   torch
+ intel-pti==0.16.0
+-    # via torch
+ intel-sycl-rt==2025.3.2
+     # via
+     #   dpcpp-cpp-rt
+     #   oneccl
+-    #   torch
+ jinja2==3.1.6
+     # via
+     #   -c requirements/xpu.txt
+     #   lm-eval
+-    #   torch
+ jiwer==4.0.0
+     # via -r requirements/test/xpu.in
+ joblib==1.5.3
+@@ -277,7 +264,6 @@ mkl==2025.3.1
+     #   onemkl-sycl-lapack
+     #   onemkl-sycl-rng
+     #   onemkl-sycl-sparse
+-    #   torch
+ modelscope==1.35.3
+     # via -r requirements/test/xpu.in
+ more-itertools==10.8.0
+@@ -299,7 +285,6 @@ multiprocess==0.70.19
+ networkx==3.6.1
+     # via
+     #   scikit-image
+-    #   torch
+ nltk==3.9.4
+     # via rouge-score
+ num2words==0.5.14
+@@ -333,31 +318,22 @@ numpy==2.2.6
+     #   soundfile
+     #   soxr
+     #   tifffile
+-    #   torchvision
+     #   transformers
+ oneccl==2021.17.2
+     # via
+     #   oneccl-devel
+-    #   torch
+ oneccl-devel==2021.17.2
+-    # via torch
+ onemkl-license==2025.3.1
+     # via
+     #   mkl
+-    #   torch
+ onemkl-sycl-blas==2025.3.1
+     # via
+     #   onemkl-sycl-lapack
+     #   onemkl-sycl-sparse
+-    #   torch
+ onemkl-sycl-dft==2025.3.1
+-    # via torch
+ onemkl-sycl-lapack==2025.3.1
+-    # via torch
+ onemkl-sycl-rng==2025.3.1
+-    # via torch
+ onemkl-sycl-sparse==2025.3.1
+-    # via torch
+ openai-harmony==0.0.8
+     # via
+     #   -c requirements/common.txt
+@@ -393,7 +369,6 @@ pillow==12.1.1
+     #   imageio
+     #   mistral-common
+     #   scikit-image
+-    #   torchvision
+ platformdirs==4.9.4
+     # via pooch
+ pluggy==1.6.0
+@@ -572,7 +547,6 @@ setuptools==80.10.2
+     #   -c requirements/xpu.txt
+     #   modelscope
+     #   pytablewriter
+-    #   torch
+ shellingham==1.5.4
+     # via typer
+ six==1.17.0
+@@ -604,7 +578,6 @@ starlette-testclient==0.4.1
+ structlog==25.5.0
+     # via gpt-oss
+ sympy==1.14.0
+-    # via torch
+ tabledata==1.3.4
+     # via pytablewriter
+ tabulate==0.10.0
+@@ -613,13 +586,11 @@ tbb==2022.3.1
+     # via
+     #   intel-opencl-rt
+     #   mkl
+-    #   torch
+ tblib==3.1.0
+     # via -r requirements/test/xpu.in
+ tcmlib==1.4.1
+     # via
+     #   tbb
+-    #   torch
+     #   umf
+ tcolorpy==0.1.7
+     # via pytablewriter
+@@ -646,15 +617,12 @@ tokenizers==0.22.2
+     # via
+     #   -c requirements/common.txt
+     #   transformers
+-torch==2.11.0+xpu
+     # via
+     #   -c requirements/xpu.txt
+     #   accelerate
+     #   mteb
+     #   sentence-transformers
+     #   timm
+-    #   torchvision
+-torchvision==0.26.0+xpu
+     # via timm
+ tqdm==4.67.3
+     # via
+@@ -673,7 +641,6 @@ transformers==5.5.3
+     #   -c requirements/common.txt
+     #   sentence-transformers
+ triton-xpu==3.7.0
+-    # via torch
+ typepy==1.3.4
+     # via
+     #   dataproperty
+@@ -705,7 +672,6 @@ typing-extensions==4.15.0
+     #   schemathesis
+     #   sentence-transformers
+     #   starlette
+-    #   torch
+     #   typing-inspection
+ typing-inspection==0.4.2
+     # via
+@@ -714,7 +680,6 @@ typing-inspection==0.4.2
+ umf==1.0.3
+     # via
+     #   intel-cmplr-lib-ur
+-    #   torch
+ urllib3==2.6.3
+     # via
+     #   blobfile
+diff --git a/requirements/xpu.txt b/requirements/xpu.txt
+index e2a7adb..fc33585 100644
+--- a/requirements/xpu.txt
++++ b/requirements/xpu.txt
+@@ -11,10 +11,6 @@ wheel
+ jinja2>=3.1.6
+ datasets # for benchmark scripts
+ numba == 0.65.0 # Required for N-gram speculative decoding
+---extra-index-url=https://download.pytorch.org/whl/xpu
+-torch==2.11.0
+-torchaudio
+-torchvision
+ 
+ auto_round_lib>=0.13.0
+ vllm_xpu_kernels @ https://github.com/vllm-project/vllm-xpu-kernels/releases/download/v0.1.9/vllm_xpu_kernels-0.1.9-cp38-abi3-manylinux_2_28_x86_64.whl
+diff --git a/setup.py b/setup.py
+index b674d55..545b638 100644
+--- a/setup.py
++++ b/setup.py
+@@ -1043,7 +1043,8 @@ if _is_cuda() or _is_hip():
+     # copying the relevant .py files from the source repository.
+     ext_modules.append(CMakeExtension(name="vllm.triton_kernels", optional=True))
+ 
+-ext_modules.append(CMakeExtension(name="vllm.spinloop"))
++if sys.version_info >= (3, 11):
++    ext_modules.append(CMakeExtension(name="vllm.spinloop"))
+ 
+ if _is_hip():
+     ext_modules.append(CMakeExtension(name="vllm._rocm_C"))

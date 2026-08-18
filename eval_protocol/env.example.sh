@@ -11,8 +11,10 @@ export PYTHONPATH="${ROOT}:${CODE_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 # Python used by EvalScope launchers and protocol tools.
 export PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-# Python that can import vLLM. May be the same as PYTHON_BIN on a new server.
-export VLLM_PYTHON="${VLLM_PYTHON:-$PYTHON_BIN}"
+# Unified vLLM env for Gemma4, Qwen3-30B-A3B, and Qwen3.6-35B-A3B.
+# Recreate it on a new server with eval_protocol/envs/gemma4-vllm-cu128/setup_gemma4_vllm_cu128.sh
+export VLLM_ENV="${VLLM_ENV:-$HOME/.conda/envs/gemma4-vllm-cu128}"
+export VLLM_PYTHON="${VLLM_PYTHON:-$VLLM_ENV/bin/python}"
 
 # Base model checkpoints live outside this repo.
 export MODEL_PATH="${MODEL_PATH:-/path/to/Qwen3-30B-A3B-Instruct-2507}"

@@ -36,8 +36,12 @@ git clone git@github.com:359171110/evalscope.git
 cd evalscope
 pip install -e .
 
+# Recreate the frozen vLLM env (Gemma4 / Qwen3 / Qwen3.6, CUDA 12.8).
+bash eval_protocol/envs/gemma4-vllm-cu128/setup_gemma4_vllm_cu128.sh
+
 cp eval_protocol/env.example.sh eval_protocol/env.sh
-# 编辑 env.sh：PYTHON_BIN、VLLM_PYTHON、MODEL_PATH、DATASET_ROOT
+# 编辑 env.sh：PYTHON_BIN、MODEL_PATH、DATASET_ROOT
+# VLLM_PYTHON 默认已指向 ~/.conda/envs/gemma4-vllm-cu128/bin/python
 source eval_protocol/env.sh
 ```
 
