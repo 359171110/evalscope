@@ -39,7 +39,7 @@ EXPERIMENT_NAME_RE = re.compile(
     r'(?P<pruning>[A-Za-z0-9.-]+)_'
     r'(?P<inference>vllm|transformer)_'
     r'(?P<calibration>[A-Za-z0-9.-]+)_'
-    r'(?P<protocol>quick9|full6_v1|full6_unlimited)_'
+    r'(?P<protocol>quick9|full6_v1)_'
     r'(?P<method>[A-Za-z0-9-]+)_'
     r'(?P<timestamp>\d{12})_'
     r'(?P<seed>\d+)$'

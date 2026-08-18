@@ -347,19 +347,24 @@ prediction cache。
 ARC -> HellaSwag -> WinoGrande -> GSM8K -> MATH-500 -> MMLU
 ```
 
-| 数据集 | 抽取方式 | 样本数 | `max_tokens` |
-| --- | --- | ---: | ---: |
-| ARC | Challenge、Easy 各前 300 条 | 600 | 2048 |
-| HellaSwag | default 前 1000 条 | 1000 | 512 |
-| WinoGrande | default 前 400 条 | 400 | 1024 |
-| GSM8K | main 前 128 条，0-shot | 128 | 2048 |
-| MATH-500 | 5 Levels 各前 20 条 | 100 | 4096 |
-| MMLU | 57 subjects 各前 10 条 | 570 | 2048 |
+Quick9 使用子集抽样；`full6_v1` 使用同一六个数据集的全部样本。两套协议共用下面的
+`max_tokens` 生成上限：截断的是每条样本的输出长度，不是评测条数。
 
-总计 2798 条，`shuffle=false`，`seed=42`，`temperature=0`，`do_sample=false`，
-`enable_thinking=false`。Quick9 默认报告六个数据集分数和六数据集宏平均，不使用样本数加权
-结果冒充总分。vLLM/EvalScope launcher 必须在每个请求中显式传递
+| 数据集 | Quick9 抽取 | Quick9 样本数 | full6_v1 样本数 | `max_tokens` |
+| --- | --- | ---: | ---: | ---: |
+| ARC | Challenge、Easy 各前 300 条 | 600 | 3548 | 2048 |
+| HellaSwag | default 前 1000 条 | 1000 | 10042 | 512 |
+| WinoGrande | default 前 400 条 | 400 | 1267 | 1024 |
+| GSM8K | main 前 128 条，0-shot | 128 | 1319 | 2048 |
+| MATH-500 | 5 Levels 各前 20 条 | 100 | 500 | 4096 |
+| MMLU | 57 subjects 各前 10 条 | 570 | 14042 | 2048 |
+
+Quick9 总计 2798 条；`full6_v1` 总计 30718 条。两者都是 `shuffle=false`，`seed=42`，
+`temperature=0`，`do_sample=false`，`enable_thinking=false`。Quick9 与 full6_v1 都报告
+六个数据集分数和六数据集宏平均，不使用样本数加权结果冒充总分。不得把 Quick9 分数与
+full6_v1 分数并排发布。vLLM/EvalScope launcher 必须在每个请求中显式传递
 `extra_body.chat_template_kwargs.enable_thinking=false`，不能只依赖服务端默认值。
+`full6_v1` launcher 不得传 `--limit`。
 
 ## 8. 使用 profile 跑评测
 
@@ -769,7 +774,9 @@ find "$EXPERIMENT_DIR" -type f | sort
 grep -R "Traceback\|CUDA out of memory\|OutOfMemoryError" "$EXPERIMENT_DIR" || true
 ```
 
-必须确认六个 aggregate report 样本数精确为：
+必须按协议确认六个 aggregate report 样本数精确为：
+
+Quick9：
 
 ```text
 ARC 600
@@ -780,4 +787,16 @@ MATH-500 100
 MMLU 570
 ```
 
-缺失 shard、样本数错误、配置漂移或未说明异常时，不得发布 Quick9 横向比较结果。
+full6_v1：
+
+```text
+ARC 3548
+HellaSwag 10042
+WinoGrande 1267
+GSM8K 1319
+MATH-500 500
+MMLU 14042
+```
+
+缺失 shard、样本数错误、配置漂移或未说明异常时，不得发布横向比较结果。Quick9 与
+full6_v1 不得混表。

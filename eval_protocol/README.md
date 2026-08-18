@@ -10,7 +10,7 @@
 包含：
 
 - EvalScope 本体，以及本地 MMLU / WinoGrande 加载补丁
-- 冻结协议：`quick9`、`full6_v1`、`full6_unlimited`
+- 冻结协议：`quick9`、`full6_v1`
 - 结果目录创建、vLLM 评测入口、报告汇总脚本
 - 各剪枝方法的**源代码**（`static_moe_prunning`、`WICK`、`PP`、`TENP`、`NAPS`、`NAPS_v2`、`RAMP`、`AIMER`、`reap`）
 
@@ -63,7 +63,7 @@ ps -eo pid,ppid,pgid,sid,stat,etime,args |
 
 ## 4. 冻结评测协议
 
-三个协议共用同一数据顺序：
+两个协议共用同一数据顺序：
 
 ```text
 ARC -> HellaSwag -> WinoGrande -> GSM8K -> MATH-500 -> MMLU
@@ -75,11 +75,12 @@ ARC -> HellaSwag -> WinoGrande -> GSM8K -> MATH-500 -> MMLU
 
 报告六个数据集分数和六数据集宏平均，不用样本数加权冒充总分。
 
-| 协议 | 用途 | 样本数 | `max_tokens` |
+| 协议 | 用途 | 样本 | 生成截断 `max_tokens` |
 | --- | --- | --- | --- |
-| `quick9` | 冻结的快速横向比较 | 600 / 1000 / 400 / 128 / 100 / 570，共 2798 | ARC 2048，HellaSwag 512，WinoGrande 1024，GSM8K 2048，MATH-500 4096，MMLU 2048 |
-| `full6_v1` | 正式全量确认，样本数与 Quick9 相同 | 同上 2798 | 同上。与 Quick9 的差别是实验目录里的协议字段，不是另一套抽样 |
-| `full6_unlimited` | NAPS 等全 split 评测 | 3548 / 10042 / 1267 / 1319 / 500 / 14042 | 同上。分数不能和 Quick9 / full6_v1 并排当同一协议 |
+| `quick9` | 冻结的快速横向比较 | 子集抽样：600 / 1000 / 400 / 128 / 100 / 570，共 2798 | ARC 2048，HellaSwag 512，WinoGrande 1024，GSM8K 2048，MATH-500 4096，MMLU 2048 |
+| `full6_v1` | 正式全量确认 | 六个数据集全部样本：3548 / 10042 / 1267 / 1319 / 500 / 14042，共 30718 | 与 Quick9 相同。截断的是每条样本的生成长度，不是评测条数 |
+
+`full6_v1` 不传 `--limit`，跑完整 split。每个数据集仍设置 `max_tokens`，避免无限生成。不要把 Quick9 分数和 full6_v1 分数并排当成同一协议。
 
 旧的 Qwen3-30B Quick9 曾用 `64/32/32/1024/4096/1536`。那是另一套 generation 预算；改过 `max_tokens` 的实验必须使用新 work dir，不得复用旧 prediction cache。
 
@@ -87,7 +88,6 @@ ARC -> HellaSwag -> WinoGrande -> GSM8K -> MATH-500 -> MMLU
 
 - `eval_protocol/quick9.json`
 - `eval_protocol/full6_v1.json`
-- `eval_protocol/full6_unlimited.json`
 
 ## 5. 结果目录命名
 

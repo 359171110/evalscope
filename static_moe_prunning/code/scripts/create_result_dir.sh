@@ -23,7 +23,7 @@ Usage:
     --inference vllm|transformer \
     --calibration WikiText128x2048|Mixed512x1024|CalibrationFree \
         [--model NAME] \
-        [--protocol quick9|full6_v1|full6_unlimited] \
+        [--protocol quick9|full6_v1] \
     --method NAME \
         [--pruning-ratio-label NAME] \
         [--pruning-ratio-percent NUMBER] \
@@ -110,8 +110,8 @@ case "$CALIBRATION" in
     WikiText128x2048|Mixed512x1024|CalibrationFree) ;;
     *) die "Unknown calibration identity '$CALIBRATION'." ;;
 esac
-[[ "$PROTOCOL" == "quick9" || "$PROTOCOL" == "full6_v1" || "$PROTOCOL" == "full6_unlimited" ]] ||
-    die "Protocol must be quick9, full6_v1, or full6_unlimited."
+[[ "$PROTOCOL" == "quick9" || "$PROTOCOL" == "full6_v1" ]] ||
+    die "Protocol must be quick9 or full6_v1."
 [[ "$MODEL" =~ ^[A-Za-z0-9]+([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
     die "Model must contain only letters, numbers, dots, and hyphens."
 [[ "$METHOD" =~ ^[A-Za-z0-9]+([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||

@@ -8,6 +8,7 @@
   "enable_thinking": false,
   "eval_batch_size": 16,
   "timeout": 1200,
+  "sample_policy": "subset",
   "expected_total": 2798,
   "dataset_order": ["arc", "hellaswag", "winogrande", "gsm8k", "math_500", "mmlu"],
   "datasets": [

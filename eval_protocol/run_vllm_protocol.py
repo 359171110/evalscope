@@ -13,7 +13,7 @@ from typing import Any
 
 
 PROTOCOL_DIR = Path(__file__).resolve().parent
-SUPPORTED_PROTOCOLS = ('quick9', 'full6_v1', 'full6_unlimited')
+SUPPORTED_PROTOCOLS = ('quick9', 'full6_v1')
 
 
 def parse_args() -> argparse.Namespace:
@@ -97,8 +97,6 @@ def build_command(
         item['name'],
         '--dataset-args',
         dataset_args_json(item),
-        '--limit',
-        str(item['limit']),
         '--generation-config',
         generation_config(protocol, int(item['max_tokens'])),
         '--eval-batch-size',
@@ -111,6 +109,8 @@ def build_command(
         str(work_dir),
         '--no-timestamp',
     ]
+    if item.get('limit') is not None and protocol.get('sample_policy') != 'full_split':
+        command.extend(['--limit', str(item['limit'])])
     if (work_dir / 'predictions').is_dir():
         command.extend(['--use-cache', str(work_dir)])
     return command

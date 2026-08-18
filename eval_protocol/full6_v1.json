@@ -1,6 +1,6 @@
 {
   "name": "full6_v1",
-  "description": "Formal six-dataset confirmation protocol with the same subset limits as Quick9 and the Qwen3.6 7.1 generation budgets.",
+  "description": "Formal six-dataset full-split protocol. Every available eval sample is scored; generation is capped per dataset by max_tokens.",
   "seed": 42,
   "shuffle": false,
   "temperature": 0.0,
@@ -8,14 +8,15 @@
   "enable_thinking": false,
   "eval_batch_size": 16,
   "timeout": 1200,
-  "expected_total": 2798,
+  "sample_policy": "full_split",
+  "expected_total": 30718,
   "dataset_order": ["arc", "hellaswag", "winogrande", "gsm8k", "math_500", "mmlu"],
   "datasets": [
     {
       "name": "arc",
       "label": "ARC",
-      "limit": 300,
-      "expected_samples": 600,
+      "limit": null,
+      "expected_samples": 3548,
       "max_tokens": 2048,
       "path_env": "ARC_PATH",
       "dataset_args": {
@@ -25,8 +26,8 @@
     {
       "name": "hellaswag",
       "label": "HellaSwag",
-      "limit": 1000,
-      "expected_samples": 1000,
+      "limit": null,
+      "expected_samples": 10042,
       "max_tokens": 512,
       "path_env": "HELLASWAG_PATH",
       "dataset_args": {}
@@ -34,8 +35,8 @@
     {
       "name": "winogrande",
       "label": "WinoGrande",
-      "limit": 400,
-      "expected_samples": 400,
+      "limit": null,
+      "expected_samples": 1267,
       "max_tokens": 1024,
       "path_env": "WINOGRANDE_PATH",
       "dataset_args": {}
@@ -43,8 +44,8 @@
     {
       "name": "gsm8k",
       "label": "GSM8K",
-      "limit": 128,
-      "expected_samples": 128,
+      "limit": null,
+      "expected_samples": 1319,
       "max_tokens": 2048,
       "path_env": "GSM8K_PATH",
       "dataset_args": {
@@ -54,8 +55,8 @@
     {
       "name": "math_500",
       "label": "MATH-500",
-      "limit": 20,
-      "expected_samples": 100,
+      "limit": null,
+      "expected_samples": 500,
       "max_tokens": 4096,
       "path_env": "MATH_500_PATH",
       "dataset_args": {}
@@ -63,8 +64,8 @@
     {
       "name": "mmlu",
       "label": "MMLU",
-      "limit": 10,
-      "expected_samples": 570,
+      "limit": null,
+      "expected_samples": 14042,
       "max_tokens": 2048,
       "path_env": "MMLU_PATH",
       "dataset_args": {}

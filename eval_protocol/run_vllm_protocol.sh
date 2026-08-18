@@ -9,7 +9,7 @@ if [[ $# -lt 4 ]]; then
 Usage: $0 MODEL_ID API_URL METHOD EXPERIMENT_DIR
 
 Required environment:
-  PROTOCOL=quick9|full6_v1|full6_unlimited
+  PROTOCOL=quick9|full6_v1
   PYTHON_BIN, ARC_PATH, HELLASWAG_PATH, WINOGRANDE_PATH, GSM8K_PATH, MATH_500_PATH, MMLU_PATH
 
 Optional:
