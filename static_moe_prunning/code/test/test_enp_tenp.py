@@ -25,6 +25,14 @@ class _ToyExpert(torch.nn.Module):
         return self.down_proj(middle)
 
 
+class _FusedExperts(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate_up_proj = torch.nn.Parameter(torch.randn(2, 8, 3))
+        self.down_proj = torch.nn.Parameter(torch.randn(2, 3, 4))
+        self.act_fn = torch.nn.functional.silu
+
+
 def test_signed_projection_scores_match_explicit_channel_outputs() -> None:
     generator = torch.Generator().manual_seed(7)
     middle = torch.randn(5, 6, generator=generator)
@@ -84,6 +92,35 @@ def test_accumulator_preserves_dense_equivalent_weighted_expert_output() -> None
     assert accumulator.channel_score_sums["all"][2].shape == (2, 4)
 
 
+def test_accumulator_matches_fused_gate_up_expert_output() -> None:
+    torch.manual_seed(19)
+    experts = _FusedExperts()
+    hidden_states = torch.randn(3, 3)
+    selected = torch.tensor([[0, 1], [1, 0], [0, 1]])
+    routing_weights = torch.tensor([[0.7, 0.3], [0.8, 0.2], [0.6, 0.4]])
+    expected = torch.zeros_like(hidden_states)
+    for token_idx in range(hidden_states.shape[0]):
+        for slot_idx in range(selected.shape[1]):
+            expert_idx = int(selected[token_idx, slot_idx].item())
+            packed = hidden_states[token_idx] @ experts.gate_up_proj[expert_idx].T
+            gate_hidden, up_hidden = packed.chunk(2, dim=-1)
+            middle = experts.act_fn(gate_hidden) * up_hidden
+            expert_output = middle @ experts.down_proj[expert_idx].T
+            expected[token_idx] += routing_weights[token_idx, slot_idx] * expert_output
+
+    accumulator = EnpTenpAccumulator()
+    actual = accumulator.update_and_compute_output(
+        4,
+        hidden_states,
+        experts,
+        selected,
+        routing_weights,
+    )
+
+    torch.testing.assert_close(actual, expected, rtol=1.0e-5, atol=1.0e-6)
+    assert accumulator.channel_score_sums["all"][4].shape == (2, 4)
+
+
 def test_enp_widths_are_uniform_and_match_exact_budget() -> None:
     widths = build_enp_widths(
         num_layers=3,
@@ -113,6 +150,26 @@ def test_enp_widths_match_wikitext_25_and_50_percent_targets() -> None:
     assert bool((widths_25 == 9).all())
     assert bool((widths_50 == 6).all())
     assert int(widths_25[0, 0].item()) * 64 == 576
+    assert int(widths_50[0, 0].item()) * 64 == 384
+
+
+def test_enp_widths_match_gemma4_25_and_50_percent_targets() -> None:
+    widths_25 = build_enp_widths(
+        num_layers=30,
+        num_experts=128,
+        num_blocks=11,
+        routed_param_retention=0.75,
+    )
+    widths_50 = build_enp_widths(
+        num_layers=30,
+        num_experts=128,
+        num_blocks=11,
+        routed_param_retention=0.50,
+    )
+
+    assert bool((widths_25 == 8).all())
+    assert bool((widths_50 == 6).all())
+    assert int(widths_25[0, 0].item()) * 64 == 512
     assert int(widths_50[0, 0].item()) * 64 == 384
 
 

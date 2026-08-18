@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_RESULTS_ROOT = (
     Path(__file__).resolve().parents[2]
     / "experiments"
@@ -17,6 +16,7 @@ VARIANT_ORDER = (
     "dense",
     "enp",
     "tenp",
+    "wanda",
     "aimer",
     "pure_pseudo",
     "wick_kernel",

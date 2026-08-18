@@ -75,7 +75,7 @@ Optional options:
   -h, --help               Show this help.
 
 Methods:
-    dense, enp, tenp, aimer, pure_pseudo, wick_kernel, wick_kernel_merge,
+    dense, enp, tenp, wanda, aimer, pure_pseudo, wick_kernel, wick_kernel_merge,
     wick_pseudo_protect, wick_pseudo_protect_merge, official_reap, route_tail_global, route_tail_per_layer,
   tail_risk_global, tail_risk_per_layer
 
@@ -145,6 +145,9 @@ profile_path_for_method() {
             ;;
         tenp)
             printf '%s/tenp_%s_trapezoid.pt\n' "$PROFILE_ROOT" "$RATIO_TAG"
+            ;;
+        wanda)
+            printf '%s/wanda_%s_per_layer.pt\n' "$PROFILE_ROOT" "$RATIO_TAG"
             ;;
         aimer)
             printf '%s/aimer_%s_per_layer.pt\n' "$PROFILE_ROOT" "$RATIO_TAG"

@@ -31,7 +31,12 @@ def apply_torch_autocast_compat_patch() -> None:
     torch.is_autocast_enabled = compat_is_autocast_enabled
 
 
-def load_qwen3_moe(model_path: str, device_map=None, model_family: str | None = None):
+def load_qwen3_moe(
+    model_path: str,
+    device_map=None,
+    model_family: str | None = None,
+    device: str | None = None,
+):
     clear_hf_proxy_env()
     apply_torch_autocast_compat_patch()
     extra_site_packages = os.environ.get("MOE_EXTRA_SITE_PACKAGES")
@@ -41,12 +46,9 @@ def load_qwen3_moe(model_path: str, device_map=None, model_family: str | None = 
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     family = resolve_model_family(model_path=model_path, model_family=model_family)
-    if device_map is None:
-        device_map = {"": "cuda:0"} if torch.cuda.is_available() else {"": "cpu"}
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     model_kwargs = {
         "torch_dtype": "auto",
-        "device_map": device_map,
         "trust_remote_code": True,
     }
     if family == "qwen3":
@@ -57,7 +59,15 @@ def load_qwen3_moe(model_path: str, device_map=None, model_family: str | None = 
         model_class = getattr(transformers, "Gemma4ForConditionalGeneration", None)
     if model_class is None:
         raise ImportError(f"The installed transformers build has no model class for {family}.")
-    model = model_class.from_pretrained(model_path, **model_kwargs)
+    if device_map == "none":
+        model = model_class.from_pretrained(model_path, **model_kwargs)
+        resolved_device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        model = model.to(resolved_device)
+    else:
+        if device_map is None:
+            device_map = {"": "cuda:0"} if torch.cuda.is_available() else {"": "cpu"}
+        model_kwargs["device_map"] = device_map
+        model = model_class.from_pretrained(model_path, **model_kwargs)
     model.eval()
     return model, tokenizer
 

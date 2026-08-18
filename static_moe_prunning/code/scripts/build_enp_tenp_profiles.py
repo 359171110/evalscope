@@ -453,6 +453,11 @@ def parse_args() -> argparse.Namespace:
         default="error",
     )
     parser.add_argument("--device-map", default="cuda:0")
+    parser.add_argument(
+        "--device",
+        default=None,
+        help="Used when --device-map none, to load then move the model without accelerate.",
+    )
     return parser.parse_args()
 
 
@@ -489,6 +494,7 @@ def main() -> int:
         str(model_path),
         device_map=args.device_map,
         model_family=args.model_family,
+        device=args.device,
     )
     bindings = list(iter_moe_layer_bindings(model))
     if not bindings:

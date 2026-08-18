@@ -12,7 +12,7 @@
 - EvalScope 本体，以及本地 MMLU / WinoGrande 加载补丁
 - 冻结协议：`quick9`、`full6_v1`
 - 结果目录创建、vLLM 评测入口、报告汇总脚本
-- 各剪枝方法的**源代码**（`static_moe_prunning`、`WICK`、`PP`、`TENP`、`NAPS`、`NAPS_v2`、`RAMP`、`AIMER`、`reap`）
+- 各剪枝方法的**源代码**（`static_moe_prunning`、`WICK`、`PP`、`TENP`、`Wanda`、`NAPS`、`NAPS_v2`、`RAMP`、`AIMER`、`reap`）
 
 不包含，必须在新服务器上单独准备：
 
@@ -175,3 +175,8 @@ WATCH_SECONDS=0 bash scripts/watch_eval_reports.sh
 ```text
 STATIC_MOE_PRUNING_FRAMEWORK_MANUAL.md
 ```
+
+WikiText128x2048 + `full6_v1` 的方法入口：
+
+- ENP：`TENP/README.md`，`TENP/run_enp_wikitext128x2048.sh`，`TENP/run_gemma4_enp_wikitext128x2048.sh`
+- Wanda：`Wanda/README.md`，`Wanda/run_wikitext128x2048_full6.sh`

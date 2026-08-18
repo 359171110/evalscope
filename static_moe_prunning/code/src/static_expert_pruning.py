@@ -652,6 +652,128 @@ def build_reference_centered_route_envelope_costs(
     }
 
 
+def _expert_down_weight(experts, expert_idx: int) -> torch.Tensor:
+    if hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj") and not isinstance(
+        experts, torch.nn.ModuleList
+    ):
+        return experts.down_proj[int(expert_idx)]
+    return experts[int(expert_idx)].down_proj.weight
+
+
+@torch.no_grad()
+def apply_static_down_projection_merge_plan(
+    model,
+    merge_plan: Mapping[str, object],
+    channel_table: ChannelTable,
+    profile_widths: Mapping[int, torch.Tensor],
+    *,
+    merge_plan_file_sha256: str,
+) -> dict[str, int]:
+    """Apply a validated sparse down-projection merge plan exactly once."""
+
+    existing = getattr(model, "_static_down_projection_merge_sha256", None)
+    if existing is not None:
+        raise ValueError(f"A static down-projection merge plan is already applied: {existing}.")
+    raw_layers = merge_plan.get("layers")
+    if not isinstance(raw_layers, Mapping):
+        raise ValueError("merge plan layers are missing.")
+    layer_plans = {int(layer_id): values for layer_id, values in raw_layers.items()}
+    expected_layers = set(profile_widths)
+    if set(layer_plans) != expected_layers:
+        raise ValueError("merge plan layers do not match profile layers.")
+
+    applied_experts = 0
+    applied_pairs = 0
+    bindings = {int(binding.layer_idx): binding for binding in iter_moe_layer_bindings(model)}
+    if set(bindings) != expected_layers:
+        raise ValueError("loaded model layers do not match merge plan layers.")
+    for layer_id in sorted(expected_layers):
+        values = layer_plans[layer_id]
+        if not isinstance(values, Mapping):
+            raise ValueError(f"merge plan layer {layer_id} is invalid.")
+        retained = values.get("retained_indices")
+        pruned = values.get("pruned_indices")
+        representative = values.get("representative_indices")
+        beta = values.get("beta")
+        if not all(isinstance(item, torch.Tensor) for item in (retained, pruned, representative, beta)):
+            raise ValueError(f"merge plan layer {layer_id} contains non-tensor values.")
+        widths = profile_widths[layer_id].detach().cpu().to(torch.long)
+        channels = channel_table[layer_id]
+        num_experts = int(widths.numel())
+        if retained.ndim != 2 or int(retained.shape[0]) != num_experts:
+            raise ValueError(f"merge plan layer {layer_id} retained_indices shape is invalid.")
+        if pruned.ndim != 2 or int(pruned.shape[0]) != num_experts:
+            raise ValueError(f"merge plan layer {layer_id} pruned_indices shape is invalid.")
+        if representative.shape != pruned.shape or beta.shape != pruned.shape:
+            raise ValueError(f"merge plan layer {layer_id} pruned tensors must align.")
+        binding = bindings[layer_id]
+        for expert_idx in range(num_experts):
+            channel_count = int(channels.block_sizes[: int(widths[expert_idx].item())].sum().item())
+            expert_retained = retained[expert_idx].detach().cpu().to(torch.long)
+            expert_pruned = pruned[expert_idx].detach().cpu().to(torch.long)
+            expert_representative = representative[expert_idx].detach().cpu().to(torch.long)
+            expert_beta = beta[expert_idx].detach().cpu().float()
+            if int(expert_retained.numel()) != channel_count:
+                raise ValueError(
+                    f"merge plan layer {layer_id} expert {expert_idx} retained count does not match profile width."
+                )
+            expected_retained = channels.ranked_indices[expert_idx, :channel_count].detach().cpu().to(torch.long)
+            if not torch.equal(expert_retained, expected_retained):
+                raise ValueError(
+                    f"merge plan layer {layer_id} expert {expert_idx} retained indices do not match channel prefix."
+                )
+            all_indices = torch.cat((expert_retained, expert_pruned))
+            if int(all_indices.numel()) != int(channels.intermediate_size) or not torch.equal(
+                torch.sort(all_indices).values,
+                torch.arange(channels.intermediate_size, dtype=torch.long),
+            ):
+                raise ValueError(
+                    f"merge plan layer {layer_id} expert {expert_idx} channel partition is invalid."
+                )
+            if not bool(torch.isfinite(expert_beta).all()):
+                raise ValueError(f"merge plan layer {layer_id} expert {expert_idx} beta contains non-finite values.")
+            accepted = expert_representative >= 0
+            if bool((expert_beta[~accepted] != 0).any()):
+                raise ValueError(
+                    f"merge plan layer {layer_id} expert {expert_idx} rejected pairs must have zero beta."
+                )
+            retained_lookup = torch.zeros(channels.intermediate_size, dtype=torch.bool)
+            retained_lookup[expert_retained] = True
+            if bool(accepted.any()) and not bool(retained_lookup[expert_representative[accepted]].all()):
+                raise ValueError(
+                    f"merge plan layer {layer_id} expert {expert_idx} representative is not retained."
+                )
+
+            down_weight = _expert_down_weight(binding.experts, expert_idx)
+            if not bool(torch.isfinite(down_weight).all()):
+                raise ValueError(f"merge plan layer {layer_id} expert {expert_idx} found non-finite base weights.")
+            retained_device = expert_retained.to(device=down_weight.device)
+            pruned_device = expert_pruned.to(device=down_weight.device)
+            representative_device = expert_representative.to(device=down_weight.device)
+            beta_device = expert_beta.to(device=down_weight.device)
+            original = down_weight.detach().float().clone()
+            merged = original.index_select(1, retained_device).clone()
+            if bool(accepted.any()):
+                accepted_device = accepted.to(device=down_weight.device)
+                retained_position = torch.full(
+                    (channels.intermediate_size,), -1, dtype=torch.long, device=down_weight.device
+                )
+                retained_position[retained_device] = torch.arange(channel_count, device=down_weight.device)
+                source_columns = original.index_select(1, pruned_device[accepted_device]) * beta_device[
+                    accepted_device
+                ][None, :]
+                target_positions = retained_position[representative_device[accepted_device]]
+                merged.index_add_(1, target_positions, source_columns)
+                applied_pairs += int(accepted.sum().item())
+            if not bool(torch.isfinite(merged).all()):
+                raise ValueError(f"merge plan layer {layer_id} expert {expert_idx} produced non-finite weights.")
+            down_weight.index_copy_(1, retained_device, merged.to(dtype=down_weight.dtype))
+            applied_experts += 1
+
+    setattr(model, "_static_down_projection_merge_sha256", str(merge_plan_file_sha256))
+    return {"applied_experts": applied_experts, "applied_pairs": applied_pairs}
+
+
 def allocate_route_envelope_constrained_prefix_widths(
     block_values: torch.Tensor,
     route_count_folds: torch.Tensor,

@@ -12,7 +12,7 @@ from safetensors.torch import save_file
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a uniformly ENP-pruned Qwen3 MoE HF checkpoint.")
+    parser = argparse.ArgumentParser(description="Export a uniformly ENP-pruned MoE HF checkpoint.")
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--channel-cache", type=Path, required=True)
@@ -43,6 +43,45 @@ def prune_tensor(name: str, tensor: torch.Tensor, retained: torch.Tensor) -> tor
     if name.endswith("down_proj.weight"):
         return tensor.index_select(1, retained)
     return tensor
+
+
+def text_config_of(config: dict[str, object]) -> dict[str, object]:
+    nested = config.get("text_config")
+    return nested if isinstance(nested, dict) else config
+
+
+def packed_layer_id(name: str) -> int | None:
+    if ".experts." not in name or ".layers." not in name:
+        return None
+    if not name.endswith(("experts.gate_up_proj", "experts.down_proj")):
+        return None
+    return int(name.split(".layers.", 1)[1].split(".", 1)[0])
+
+
+def prune_packed_tensor(
+    name: str,
+    tensor: torch.Tensor,
+    retained_by_expert: dict[tuple[int, int], torch.Tensor],
+    intermediate_size: int,
+) -> torch.Tensor:
+    if tensor.ndim != 3:
+        return tensor
+    layer_id = packed_layer_id(name)
+    if layer_id is None:
+        return tensor
+    if name.endswith("experts.gate_up_proj"):
+        selected = []
+        for expert_id in range(int(tensor.shape[0])):
+            indices = retained_by_expert[(layer_id, expert_id)]
+            packed_indices = torch.cat((indices, indices + int(intermediate_size)))
+            selected.append(tensor[expert_id].index_select(0, packed_indices))
+        return torch.stack(selected)
+    return torch.stack(
+        [
+            tensor[expert_id].index_select(1, retained_by_expert[(layer_id, expert_id)])
+            for expert_id in range(int(tensor.shape[0]))
+        ]
+    )
 
 
 def validate_enp_artifacts(
@@ -106,7 +145,8 @@ def main() -> int:
     }
 
     config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
-    source_moe_intermediate_size = int(config["moe_intermediate_size"])
+    text_config = text_config_of(config)
+    source_moe_intermediate_size = int(text_config["moe_intermediate_size"])
     if not 0 < retained_channels < source_moe_intermediate_size:
         raise ValueError("retained_channels must be positive and smaller than the source MoE intermediate size.")
 
@@ -124,6 +164,13 @@ def main() -> int:
                 ids = expert_indices(name)
                 if ids is not None:
                     tensor = prune_tensor(name, tensor, retained_by_expert[ids])
+                else:
+                    tensor = prune_packed_tensor(
+                        name,
+                        tensor,
+                        retained_by_expert,
+                        source_moe_intermediate_size,
+                    )
                 exported_shape = list(tensor.shape)
                 if exported_shape != source_shape:
                     shape_changes[name] = {"source": source_shape, "exported": exported_shape}
@@ -135,9 +182,10 @@ def main() -> int:
         print(f"Exported {shard_name}", flush=True)
 
     for source in model_path.iterdir():
-        if source.name.startswith("model-") and source.suffix == ".safetensors":
-            continue
-        if source.name in {"config.json", "model.safetensors.index.json"}:
+        if source.suffix == ".safetensors" or source.name in {
+            "config.json",
+            "model.safetensors.index.json",
+        }:
             continue
         target = output_dir / source.name
         if source.is_file():
@@ -145,7 +193,7 @@ def main() -> int:
         elif source.is_dir():
             shutil.copytree(source, target)
 
-    config["moe_intermediate_size"] = retained_channels
+    text_config["moe_intermediate_size"] = retained_channels
     exported_config_path = output_dir / "config.json"
     exported_config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     index.setdefault("metadata", {})["total_size"] = total_size

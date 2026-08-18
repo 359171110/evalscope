@@ -3,7 +3,6 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "run_downstream_matrix.sh"
 
 
@@ -18,6 +17,7 @@ def _create_artifacts(tmp_path: Path) -> tuple[Path, Path]:
         "route_tail_50pct_per_layer.pt",
         "tail_risk_50pct_per_layer.pt",
         "tenp_50pct_trapezoid.pt",
+        "wanda_50pct_per_layer.pt",
         "wick_kernel_50pct_per_layer.pt",
         "wick_kernel_merge_50pct_per_layer.pt",
         "wick_kernel_merge_plan.pt",
@@ -183,6 +183,41 @@ def test_downstream_matrix_resolves_aimer_profile(tmp_path: Path) -> None:
     assert "--dataset-limits" in result.stdout
     assert "math_500" in result.stdout
     assert "20" in result.stdout
+
+
+def test_downstream_matrix_resolves_wanda_profile(tmp_path: Path) -> None:
+    profile_root, channel_cache = _create_artifacts(tmp_path)
+    result = subprocess.run(
+        [
+            "bash",
+            str(SCRIPT),
+            "--model-path",
+            "/models/qwen3",
+            "--model-id",
+            "qwen3-wanda",
+            "--pruning-ratio",
+            "50pct",
+            "--gpus",
+            "0",
+            "--datasets",
+            "arc",
+            "--methods",
+            "wanda",
+            "--profile-root",
+            str(profile_root),
+            "--channel-cache",
+            str(channel_cache),
+            "--results-root",
+            str(tmp_path / "results"),
+            "--dry-run",
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "GPU 0 methods: wanda" in result.stdout
+    assert "wanda_50pct_per_layer.pt" in result.stdout
 
 
 def test_downstream_matrix_resolves_pure_pseudo_profile(tmp_path: Path) -> None:
