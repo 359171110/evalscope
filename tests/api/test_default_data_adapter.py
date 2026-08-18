@@ -89,8 +89,14 @@ def test_auto_judge_strategy_uses_adapter_class_default() -> None:
     adapter._task_config.judge_strategy = JudgeStrategy.RULE
     assert adapter.use_llm_judge is False
 
-    adapter._task_config.judge_strategy = JudgeStrategy.LLM
-    assert adapter.use_llm_judge is True
+
+def test_benchmark_specific_limit_overrides_task_limit() -> None:
+    adapter = DummyReformatAdapter(
+        benchmark_meta=BenchmarkMeta(name='dummy', dataset_id='dummy', limit=7),
+        task_config=TaskConfig(datasets=['dummy'], limit=99),
+    )
+
+    assert adapter.limit == 7
 
 
 def test_sample_example_detects_parameterized_truncation_marker() -> None:

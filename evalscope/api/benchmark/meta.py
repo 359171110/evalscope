@@ -122,6 +122,9 @@ class BenchmarkMeta:
     ``'1.5gb'`` (parsed by ``parse_size``).
     Useful for avoiding 413 errors when sending multi-image payloads to APIs."""
 
+    limit: Optional[Union[int, float]] = None
+    """Optional per-benchmark sample limit overriding the task-wide limit."""
+
     def __post_init__(self):
         """Validate fields after initialization."""
         if self.few_shot_num < 0:

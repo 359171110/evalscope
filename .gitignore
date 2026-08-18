@@ -125,7 +125,33 @@ replace.sh
 result.png
 result.jpg
 result.mp4
+/result/
 *.itag
+
+# Local overlay env and scratch
+.eval_protocol_env.sh
+eval_protocol/env.sh
+.tmp/
+pure-pseudo-pycache/
+
+# Method experiment artifacts, exported checkpoints, and result notes.
+# Keep source, launchers, and protocol files; rebuild caches on each server.
+**/experiments/
+**/checkpoints/
+Final_result.md
+stable_aimer_experiement.md
+idea.md
+NAPS/EXP_RESULTS.md
+NAPS_v2/ITERATION_LOG.md
+NAPS_v2/capacity_cliff_data.csv
+NAPS_v2/*.pdf
+TENP/*.pdf
+static_moe_prunning/docs/ALL_EXPERIMENTS_COMPLETE.md
+static_moe_prunning/docs/EXPERIMENT_COMPARISON_MATRIX.md
+static_moe_prunning/docs/*专利*
+static_moe_prunning/docs/patent_figures_static_moe/
+reap/fig/
+**/.git.nested.bak/
 
 # Pytorch
 *.pth

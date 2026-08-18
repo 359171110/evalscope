@@ -1,0 +1,1 @@
+"""WICK data-free MoE channel pruning."""

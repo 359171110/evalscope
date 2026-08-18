@@ -1,5 +1,10 @@
+import json
+import os
+import zipfile
+from typing import Type
+
 from evalscope.api.benchmark import BenchmarkMeta, MultiChoiceAdapter
-from evalscope.api.dataset import Sample
+from evalscope.api.dataset import DataLoader, Dataset, DictDataLoader, Sample
 from evalscope.api.registry import register_benchmark
 from evalscope.constants import Tags
 from evalscope.utils.multi_choices import MultipleChoiceTemplate
@@ -51,10 +56,29 @@ class WinograndeAdapter(MultiChoiceAdapter):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
+    def load_subset(self, subset: str, data_loader: Type[DataLoader]) -> Dataset:
+        if not os.path.isfile(self.dataset_id) or not zipfile.is_zipfile(self.dataset_id):
+            return super().load_subset(subset, data_loader)
+
+        with zipfile.ZipFile(self.dataset_id) as archive:
+            with archive.open('winogrande_1.1/dev.jsonl') as jsonl_file:
+                records = [json.loads(line) for line in jsonl_file]
+
+        return DictDataLoader(
+            dict_list=records,
+            sample_fields=self.record_to_sample,
+            filter_func=self.sample_filter,
+            limit=self.limit,
+            repeats=self.repeats,
+            shuffle=self.shuffle,
+            shuffle_choices=self.shuffle_choices,
+            data_source=self.dataset_hub,
+        ).load()
+
     def record_to_sample(self, record) -> Sample:
         return Sample(
             input=record['sentence'],
             choices=[record['option1'], record['option2']],
             target=chr(ord('A') + int(record['answer']) - 1),  # Convert 1,2 to A,B
-            metadata={'id': record.get('id', 'unknown')},
+            metadata={'id': record.get('id', record.get('qID', 'unknown'))},
         )

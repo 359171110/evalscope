@@ -1,0 +1,73 @@
+{
+  "name": "quick9",
+  "description": "Frozen six-dataset screening protocol. Sample counts are protocol identity; max_tokens follow Qwen3.6 7.1 defaults.",
+  "seed": 42,
+  "shuffle": false,
+  "temperature": 0.0,
+  "do_sample": false,
+  "enable_thinking": false,
+  "eval_batch_size": 16,
+  "timeout": 1200,
+  "expected_total": 2798,
+  "dataset_order": ["arc", "hellaswag", "winogrande", "gsm8k", "math_500", "mmlu"],
+  "datasets": [
+    {
+      "name": "arc",
+      "label": "ARC",
+      "limit": 300,
+      "expected_samples": 600,
+      "max_tokens": 2048,
+      "path_env": "ARC_PATH",
+      "dataset_args": {
+        "subset_list": ["ARC-Challenge", "ARC-Easy"]
+      }
+    },
+    {
+      "name": "hellaswag",
+      "label": "HellaSwag",
+      "limit": 1000,
+      "expected_samples": 1000,
+      "max_tokens": 512,
+      "path_env": "HELLASWAG_PATH",
+      "dataset_args": {}
+    },
+    {
+      "name": "winogrande",
+      "label": "WinoGrande",
+      "limit": 400,
+      "expected_samples": 400,
+      "max_tokens": 1024,
+      "path_env": "WINOGRANDE_PATH",
+      "dataset_args": {}
+    },
+    {
+      "name": "gsm8k",
+      "label": "GSM8K",
+      "limit": 128,
+      "expected_samples": 128,
+      "max_tokens": 2048,
+      "path_env": "GSM8K_PATH",
+      "dataset_args": {
+        "few_shot_num": 0
+      }
+    },
+    {
+      "name": "math_500",
+      "label": "MATH-500",
+      "limit": 20,
+      "expected_samples": 100,
+      "max_tokens": 4096,
+      "path_env": "MATH_500_PATH",
+      "dataset_args": {}
+    },
+    {
+      "name": "mmlu",
+      "label": "MMLU",
+      "limit": 10,
+      "expected_samples": 570,
+      "max_tokens": 2048,
+      "path_env": "MMLU_PATH",
+      "dataset_args": {}
+    }
+  ]
+}

@@ -133,6 +133,9 @@ class DataAdapter(LLMJudgeMixin, ABC):
         """
         Return the limit for the benchmark.
         """
+        benchmark_limit = getattr(self._benchmark_meta, 'limit', None)
+        if benchmark_limit is not None:
+            return benchmark_limit
         return self._task_config.limit
 
     @property

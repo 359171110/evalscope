@@ -1,0 +1,72 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+.omx/
+.vscode/
+.idea/
+.DS_Store
+*.swp
+*.tmp
+.env
+.env.*
+!.env.example
+
+# Generated experiment artifacts are intentionally rebuilt on each server.
+experiments/calibration/
+experiments/logs/
+experiments/profiles/
+experiments/results/
+experiments/comparisons/
+
+# Frozen AMP/AIMER expert-prior tables are versioned inputs. Their builders
+# will be published separately; keep this allowlist narrow.
+!experiments/calibration/
+experiments/calibration/*
+!experiments/calibration/FROZEN_PRIORS.sha256
+!experiments/calibration/qwen15_moe_priors_20260728/
+!experiments/calibration/qwen15_moe_priors_20260728/amp_scores.pt
+!experiments/calibration/qwen15_moe_priors_20260728/aimer_scores.pt
+!experiments/calibration/qwen3_base_priors_20260728/
+!experiments/calibration/qwen3_base_priors_20260728/amp_scores.pt
+!experiments/calibration/qwen3_base_priors_20260728/aimer_scores.pt
+!experiments/calibration/static_expert_priors_20260728/
+!experiments/calibration/static_expert_priors_20260728/amp_scores.pt
+!experiments/calibration/static_expert_priors_20260728/aimer_scores.pt
+!experiments/calibration/qwen35_prospective_priors_20260728/
+!experiments/calibration/qwen35_prospective_priors_20260728/amp_scores.pt
+!experiments/calibration/qwen35_prospective_priors_20260728/aimer_scores.pt
+
+# Model checkpoints, tensor caches, and large generated datasets.
+*.safetensors
+*.ckpt
+*.pth
+*.pt
+*.npy
+*.npz
+pytorch_model*.bin
+model-*-of-*.bin
+tokenizer.json
+
+# Re-allow the frozen priors after the global tensor-cache rules above.
+!experiments/calibration/qwen15_moe_priors_20260728/amp_scores.pt
+!experiments/calibration/qwen15_moe_priors_20260728/aimer_scores.pt
+!experiments/calibration/qwen3_base_priors_20260728/amp_scores.pt
+!experiments/calibration/qwen3_base_priors_20260728/aimer_scores.pt
+!experiments/calibration/static_expert_priors_20260728/amp_scores.pt
+!experiments/calibration/static_expert_priors_20260728/aimer_scores.pt
+!experiments/calibration/qwen35_prospective_priors_20260728/amp_scores.pt
+!experiments/calibration/qwen35_prospective_priors_20260728/aimer_scores.pt
+
+# Third-party comparison checkouts and REAP-specific publication helpers are
+# outside this method repository's release boundary.
+third_party/
+scripts/fetch_reap.sh
+scripts/run_reap_full.sh
+scripts/run_full_comparison.sh
+docs/REAP_ROUTE_TAIL_TAIL_RISK_EXPERIMENT_PLAN.md
+

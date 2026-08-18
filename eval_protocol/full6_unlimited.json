@@ -1,0 +1,73 @@
+{
+  "name": "full6_unlimited",
+  "description": "Six-dataset full-split protocol used by NAPS-style runs. Do not mix scores with Quick9 or full6_v1 subset results.",
+  "seed": 42,
+  "shuffle": false,
+  "temperature": 0.0,
+  "do_sample": false,
+  "enable_thinking": false,
+  "eval_batch_size": 16,
+  "timeout": 1200,
+  "expected_total": 30718,
+  "dataset_order": ["arc", "hellaswag", "winogrande", "gsm8k", "math_500", "mmlu"],
+  "datasets": [
+    {
+      "name": "arc",
+      "label": "ARC",
+      "limit": 3548,
+      "expected_samples": 3548,
+      "max_tokens": 2048,
+      "path_env": "ARC_PATH",
+      "dataset_args": {
+        "subset_list": ["ARC-Challenge", "ARC-Easy"]
+      }
+    },
+    {
+      "name": "hellaswag",
+      "label": "HellaSwag",
+      "limit": 10042,
+      "expected_samples": 10042,
+      "max_tokens": 512,
+      "path_env": "HELLASWAG_PATH",
+      "dataset_args": {}
+    },
+    {
+      "name": "winogrande",
+      "label": "WinoGrande",
+      "limit": 1267,
+      "expected_samples": 1267,
+      "max_tokens": 1024,
+      "path_env": "WINOGRANDE_PATH",
+      "dataset_args": {}
+    },
+    {
+      "name": "gsm8k",
+      "label": "GSM8K",
+      "limit": 1319,
+      "expected_samples": 1319,
+      "max_tokens": 2048,
+      "path_env": "GSM8K_PATH",
+      "dataset_args": {
+        "few_shot_num": 0
+      }
+    },
+    {
+      "name": "math_500",
+      "label": "MATH-500",
+      "limit": 500,
+      "expected_samples": 500,
+      "max_tokens": 4096,
+      "path_env": "MATH_500_PATH",
+      "dataset_args": {}
+    },
+    {
+      "name": "mmlu",
+      "label": "MMLU",
+      "limit": 14042,
+      "expected_samples": 14042,
+      "max_tokens": 2048,
+      "path_env": "MMLU_PATH",
+      "dataset_args": {}
+    }
+  ]
+}

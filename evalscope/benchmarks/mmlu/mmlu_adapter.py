@@ -1,7 +1,11 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
 
+import csv
+import os
+from typing import Type
+
 from evalscope.api.benchmark import BenchmarkMeta, MultiChoiceAdapter
-from evalscope.api.dataset import Sample
+from evalscope.api.dataset import DataLoader, Dataset, DictDataLoader, Sample
 from evalscope.api.registry import register_benchmark
 from evalscope.constants import Tags
 from evalscope.utils.logger import get_logger
@@ -119,6 +123,46 @@ class MMLUAdapter(MultiChoiceAdapter):
 
         self.reformat_subset = True
         self.category_map = {k: v[-1] for k, v in SUBJECT_MAPPING.items()}
+
+    def _load_local_csv_split(self, split: str) -> Dataset:
+        split_dir = os.path.join(self.dataset_id, split)
+        if not os.path.isdir(split_dir):
+            raise FileNotFoundError(f'MMLU split directory does not exist: {split_dir}')
+
+        records = []
+        for subject in self.subset_list:
+            csv_path = os.path.join(split_dir, f'{subject}_{split}.csv')
+            if not os.path.isfile(csv_path):
+                raise FileNotFoundError(f'MMLU subject file does not exist: {csv_path}')
+            with open(csv_path, newline='', encoding='utf-8') as csv_file:
+                for row in csv.reader(csv_file):
+                    if len(row) != 6:
+                        raise ValueError(f'Expected 6 columns in {csv_path}, got {len(row)}')
+                    records.append({
+                        'question': row[0],
+                        'choices': row[1:5],
+                        'answer': 'ABCD'.index(row[5]),
+                        'subject': subject,
+                    })
+
+        return DictDataLoader(
+            dict_list=records,
+            sample_fields=self.record_to_sample,
+            filter_func=self.sample_filter,
+            shuffle=self.shuffle if split == self.eval_split else self.few_shot_random,
+            shuffle_choices=self.shuffle_choices,
+            data_source=self.dataset_hub,
+        ).load()
+
+    def load_subset(self, subset: str, data_loader: Type[DataLoader]) -> Dataset:
+        if os.path.isdir(self.dataset_id):
+            return self._load_local_csv_split(self.eval_split)
+        return super().load_subset(subset, data_loader)
+
+    def load_fewshot_subset(self, subset: str, data_loader: Type[DataLoader]) -> Dataset:
+        if os.path.isdir(self.dataset_id):
+            return self._load_local_csv_split(self.train_split)
+        return super().load_fewshot_subset(subset, data_loader)
 
     def record_to_sample(self, record) -> Sample:
         return Sample(
