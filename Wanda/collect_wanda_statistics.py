@@ -55,8 +55,16 @@ def router_top_k(block: torch.nn.Module) -> int:
 
 
 def load_causal_or_conditional_model(model_path: Path, load_kwargs: dict[str, object]) -> torch.nn.Module:
-    from transformers import AutoModelForCausalLM
+    """Load CausalLM or VLM ConditionalGeneration checkpoints used by the four MoE families."""
 
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    config = AutoConfig.from_pretrained(str(model_path), trust_remote_code=True)
+    architectures = [str(item) for item in (getattr(config, "architectures", None) or [])]
+    if any("ConditionalGeneration" in item for item in architectures):
+        from transformers import AutoModelForImageTextToText
+
+        return AutoModelForImageTextToText.from_pretrained(model_path, **load_kwargs)
     return AutoModelForCausalLM.from_pretrained(model_path, **load_kwargs)
 
 
@@ -69,7 +77,7 @@ class Gemma4WandaCapture:
             if module.__class__.__name__ != "Gemma4TextDecoderLayer":
                 continue
             layer_id = int(module.layer_idx)
-            if layer_id not in statistics.layer_ids:
+            if layer_id not in statistics.layer_ids or not hasattr(module, "experts"):
                 continue
             self.handles.append(module.experts.register_forward_pre_hook(self._hook(layer_id, statistics)))
             found.add(layer_id)
@@ -145,6 +153,56 @@ class QwenWandaCapture:
             raise RuntimeError(f"Unmatched Qwen router inputs: {sorted(self.pending)}")
 
 
+class DeepSeekWandaCapture:
+    """Capture native DeepSeek-V2 routing without calling ``gate`` as a Linear."""
+
+    def __init__(self, model: torch.nn.Module, statistics: WandaStatistics) -> None:
+        self.handles = []
+        found = set()
+        supported = {"DeepseekV2MoE", "DeepseekV2Moe"}
+        for name, module in model.named_modules():
+            if module.__class__.__name__ not in supported:
+                continue
+            parts = name.split(".")
+            if "layers" not in parts:
+                continue
+            layer_id = int(parts[parts.index("layers") + 1])
+            if layer_id not in statistics.layer_ids:
+                continue
+            self.handles.append(module.register_forward_pre_hook(self._hook(layer_id, module, statistics)))
+            found.add(layer_id)
+        missing = set(statistics.layer_ids) - found
+        if missing:
+            raise ValueError(f"Missing DeepSeek MoE layers: {sorted(missing)}")
+
+    @staticmethod
+    def _route(module: torch.nn.Module, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(module, "route_tokens_to_experts"):
+            router_logits = torch.nn.functional.linear(
+                hidden_states.type(torch.float32),
+                module.gate.weight.type(torch.float32),
+            )
+            return module.route_tokens_to_experts(router_logits)
+        routed = module.gate(hidden_states)
+        if isinstance(routed, tuple) and len(routed) >= 2:
+            return routed[0], routed[1]
+        raise ValueError("DeepSeek MoE gate must return top-k indices and weights.")
+
+    @classmethod
+    def _hook(cls, layer_id: int, module: torch.nn.Module, statistics: WandaStatistics) -> Any:
+
+        def hook(_module: torch.nn.Module, args: tuple[Any, ...]) -> None:
+            hidden_states = args[0]
+            indices, weights = cls._route(module, hidden_states)
+            statistics.update(layer_id, hidden_states, indices, weights, module.experts)
+
+        return hook
+
+    def close(self) -> None:
+        for handle in self.handles:
+            handle.remove()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect train-only routed statistics for structured MoE Wanda.")
     parser.add_argument("--model-path", type=Path, required=True)
@@ -190,14 +248,18 @@ def main() -> int:
         model = model.to(torch.device(args.device))
     model.eval()
     statistics = WandaStatistics(
-        tuple(range(architecture.num_layers)),
+        architecture.moe_layer_ids(),
         architecture.num_experts,
         architecture.hidden_size,
         architecture.intermediate_size,
         args.route_weighting,
     )
-    capture = Gemma4WandaCapture(model, statistics
-                                 ) if architecture.model_family == "gemma4" else QwenWandaCapture(model, statistics)
+    if architecture.model_family == "gemma4":
+        capture = Gemma4WandaCapture(model, statistics)
+    elif architecture.model_family == "deepseek_v2":
+        capture = DeepSeekWandaCapture(model, statistics)
+    else:
+        capture = QwenWandaCapture(model, statistics)
     input_device = model.get_input_embeddings().weight.device
     try:
         with torch.inference_mode():

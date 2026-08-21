@@ -21,6 +21,10 @@ class WandaArchitecture:
     tensor_codec: Literal["separate", "packed"]
     channel_alignment: int
     branch_topology: Literal["routed_only", "gated_shared", "dense_plus_sparse"]
+    first_k_dense_replace: int = 0
+
+    def moe_layer_ids(self) -> tuple[int, ...]:
+        return tuple(range(int(self.first_k_dense_replace), int(self.num_layers)))
 
     def aligned_width(self, requested_width: int, rounding: str = "nearest") -> int:
         if requested_width <= 0:
@@ -69,11 +73,12 @@ class WandaModelAdapter:
         config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
         text_config = config.get("text_config", config)
         model_type = str(text_config.get("model_type", config.get("model_type", ""))).lower()
+        num_experts = int(text_config.get("num_experts", text_config.get("n_routed_experts", 0)))
         common = {
             "hidden_size": int(text_config["hidden_size"]),
             "intermediate_size": int(text_config["moe_intermediate_size"]),
             "num_layers": int(text_config["num_hidden_layers"]),
-            "num_experts": int(text_config["num_experts"]),
+            "num_experts": num_experts,
             "activation": str(text_config.get("hidden_activation", text_config.get("hidden_act", "silu"))),
         }
         if model_type == "qwen3_moe":
@@ -133,17 +138,38 @@ class WandaModelAdapter:
                 up_template=None,
                 down_template="model.language_model.layers.{layer}.mlp.experts.down_proj",
             )
+        elif model_type == "deepseek_v2":
+            architecture = WandaArchitecture(
+                model_family="deepseek_v2",
+                model_type=model_type,
+                router_top_k=int(text_config["num_experts_per_tok"]),
+                tensor_codec="separate",
+                channel_alignment=32,
+                branch_topology="gated_shared",
+                first_k_dense_replace=int(text_config.get("first_k_dense_replace", 0)),
+                **common,
+            )
+            adapter = cls(
+                architecture=architecture,
+                text_config=text_config,
+                router_template="model.layers.{layer}.mlp.gate.weight",
+                gate_up_template=None,
+                gate_template="model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+                up_template="model.layers.{layer}.mlp.experts.{expert}.up_proj.weight",
+                down_template="model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+            )
         else:
             raise ValueError(f"Unsupported Wanda model type: {model_type!r}.")
         adapter.validate_weight_map(weight_map)
         return adapter
 
     def validate_weight_map(self, weight_map: dict[str, str]) -> None:
-        required = [self.router_name(0), self.down_name(0, 0)]
+        first_layer = self.architecture.moe_layer_ids()[0]
+        required = [self.router_name(first_layer), self.down_name(first_layer, 0)]
         if self.architecture.tensor_codec == "packed":
-            required.append(self.gate_up_name(0))
+            required.append(self.gate_up_name(first_layer))
         else:
-            required.extend((self.gate_name(0, 0), self.up_name(0, 0)))
+            required.extend((self.gate_name(first_layer, 0), self.up_name(first_layer, 0)))
         missing = [name for name in required if name not in weight_map]
         if missing:
             raise KeyError(f"Missing {self.architecture.model_family} Wanda tensors: {missing}")

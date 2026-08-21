@@ -1,6 +1,7 @@
 # gemma4-vllm-cu128
 
-Frozen vLLM environment used for Gemma4, Qwen3-30B-A3B, and Qwen3.6-35B-A3B serving.
+Frozen vLLM environment used for Gemma4, Qwen3-30B-A3B, Qwen3.6-35B-A3B, and
+DeepSeek-V2-Lite-Chat serving.
 It matches `~/.conda/envs/gemma4-vllm-cu128` on the original server.
 
 Do not upload the 11 GiB conda env or the 12 GiB vLLM build tree. Recreate it with
@@ -23,6 +24,7 @@ Supported architectures after install:
 - `Qwen3MoeForCausalLM` (Qwen3-30B-A3B)
 - `Qwen3_5MoeForConditionalGeneration` (Qwen3.6-35B-A3B)
 - `Gemma4ForCausalLM` / `Gemma4ForConditionalGeneration`
+- `DeepseekV2ForCausalLM` (DeepSeek-V2-Lite-Chat)
 
 ## New server
 
@@ -66,3 +68,4 @@ Keep EvalScope / profile export on a separate Python if needed. This env is for 
 - Skip the Python 3.11-only `spinloop` extension so the tree builds on 3.10.
 - Add `csrc/glibc_compat.cpp` so the CUDA extensions link on older glibc.
 - Leave `torch==2.11.0+cu128` to pip/PyTorch index instead of vLLM's un-suffixed `torch==2.11.0` pin.
+- `patches/deepseek_shared_width.patch`: DeepSeek shared MLP reads `shared_expert_intermediate_size` when present, so routed `moe_intermediate_size` can shrink independently. Apply on the vLLM source after the CUDA/Python 3.10 patch. Transformers `deepseek_v2` in this env has the same fallback.

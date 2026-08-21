@@ -1,0 +1,34 @@
+diff --git a/vllm/model_executor/models/deepseek_v2.py b/vllm/model_executor/models/deepseek_v2.py
+index 80d518dacb..5ea6f61136 100644
+--- a/vllm/model_executor/models/deepseek_v2.py
++++ b/vllm/model_executor/models/deepseek_v2.py
+@@ -115,6 +115,20 @@ from .utils import (
+ logger = init_logger(__name__)
+ 
+ 
++def _shared_experts_intermediate_size(config) -> int:
++    """Fused shared-MLP width.
++
++    DeepSeek originally sizes the fused shared MLP as
++    ``moe_intermediate_size * n_shared_experts``. Structured pruning may shrink
++    routed experts independently; in that case the checkpoint sets
++    ``shared_expert_intermediate_size`` to the original fused width.
++    """
++    explicit = getattr(config, "shared_expert_intermediate_size", None)
++    if explicit is not None and int(explicit) > 0:
++        return int(explicit)
++    return int(config.moe_intermediate_size) * int(config.n_shared_experts)
++
++
+ class DeepseekAttention(nn.Module):
+     """Normal MHA implementation used by Deepseek v1."""
+ 
+@@ -311,7 +325,7 @@ class DeepseekV2MoE(nn.Module):
+         if config.n_shared_experts is None or self.is_fusion_moe_shared_experts_enabled:
+             self.shared_experts = None
+         else:
+-            intermediate_size = config.moe_intermediate_size * config.n_shared_experts
++            intermediate_size = _shared_experts_intermediate_size(config)
+ 
+             self.shared_experts = DeepseekV2MLP(
+                 hidden_size=config.hidden_size,

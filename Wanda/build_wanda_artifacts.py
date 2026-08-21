@@ -82,7 +82,8 @@ def collect_scores(
     scores: dict[int, torch.Tensor] = {}
     unseen_experts = 0
     with CheckpointReader(model_path, weight_map) as reader:
-        for layer_id in range(architecture.num_layers):
+        moe_ids = architecture.moe_layer_ids()
+        for progress, layer_id in enumerate(moe_ids, start=1):
             if layer_id not in input_sums or layer_id not in middle_sums or layer_id not in normalizers:
                 raise ValueError(f"Wanda statistics are missing layer {layer_id}.")
             if architecture.tensor_codec == "packed":
@@ -112,7 +113,7 @@ def collect_scores(
                     unseen_experts += 1
                 layer_scores.append(score.cpu())
             scores[layer_id] = torch.stack(layer_scores)
-            print(f"wanda_scoring_progress={layer_id + 1}/{architecture.num_layers}", flush=True)
+            print(f"wanda_scoring_progress={progress}/{len(moe_ids)}", flush=True)
     return scores, unseen_experts
 
 
@@ -173,11 +174,18 @@ def build_artifacts(
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     architecture = adapter.architecture
     block_size = architecture.channel_alignment
-    tables = {layer_id: build_channel_table(raw_scores[layer_id], block_size) for layer_id in raw_scores}
-    validate_rankings(tables, architecture.num_layers, architecture.num_experts, architecture.intermediate_size)
+    moe_ids = architecture.moe_layer_ids()
+    tables = {layer_id: build_channel_table(raw_scores[layer_id], block_size) for layer_id in moe_ids}
+    validate_rankings(
+        tables,
+        len(moe_ids),
+        architecture.num_experts,
+        architecture.intermediate_size,
+        layer_ids=moe_ids,
+    )
     num_blocks = architecture.intermediate_size // block_size
     retained_blocks = retained_channels // block_size
-    widths = torch.full((architecture.num_layers, architecture.num_experts), retained_blocks, dtype=torch.long)
+    widths = torch.full((len(moe_ids), architecture.num_experts), retained_blocks, dtype=torch.long)
     actual_ratio = 1.0 - retained_channels / architecture.intermediate_size
     calibration = statistics["calibration"]
     channel_payload = {
@@ -214,8 +222,8 @@ def build_artifacts(
         "calibration_split": "train",
         "calibration_frozen_before_evaluation": True,
         "test_metrics_used_for_profile": False,
-        "layer_ids": list(range(architecture.num_layers)),
-        "num_layers": architecture.num_layers,
+        "layer_ids": list(moe_ids),
+        "num_layers": len(moe_ids),
         "num_experts": architecture.num_experts,
         "num_blocks": num_blocks,
         "channel_block_size": block_size,

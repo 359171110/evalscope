@@ -13,7 +13,17 @@ from typing import Any
 
 
 PROTOCOL_DIR = Path(__file__).resolve().parent
-SUPPORTED_PROTOCOLS = ('quick9', 'full6_v1')
+SUPPORTED_PROTOCOLS = ('quick9', 'full6_v1', 'full8_v1')
+PATH_ENV_FALLBACK = {
+    'ARC_PATH': 'arc',
+    'HELLASWAG_PATH': 'hellaswag',
+    'WINOGRANDE_PATH': 'winogrande/winogrande_1.1.zip',
+    'GSM8K_PATH': 'gsm8k',
+    'MATH_500_PATH': 'math_500',
+    'MMLU_PATH': 'mmlu',
+    'HUMANEVAL_PATH': 'humaneval',
+    'MBPP_PATH': 'mbpp',
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -50,6 +60,11 @@ def selected_datasets(protocol: dict[str, Any], requested: str) -> list[dict[str
 def dataset_args_json(item: dict[str, Any]) -> str:
     path_env = str(item['path_env'])
     local_path = os.environ.get(path_env, '').strip()
+    if not local_path:
+        dataset_root = os.environ.get('DATASET_ROOT', '').strip()
+        subdir = PATH_ENV_FALLBACK.get(path_env, '')
+        if dataset_root and subdir:
+            local_path = str(Path(dataset_root) / subdir)
     if not local_path:
         raise ValueError(f'{path_env} is not set. Source eval_protocol/env.sh first.')
     args = {'local_path': local_path}

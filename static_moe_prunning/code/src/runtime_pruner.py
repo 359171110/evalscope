@@ -120,7 +120,12 @@ def compute_optional_shared_expert_output(
     hidden_states: torch.Tensor,
     shared_expert=None,
     shared_expert_gate=None,
+    shared_experts=None,
 ) -> Optional[torch.Tensor]:
-    if shared_expert is None or shared_expert_gate is None:
+    if shared_experts is not None:
+        return shared_experts(hidden_states)
+    if shared_expert is None:
         return None
+    if shared_expert_gate is None:
+        return shared_expert(hidden_states)
     return torch.sigmoid(shared_expert_gate(hidden_states)) * shared_expert(hidden_states)

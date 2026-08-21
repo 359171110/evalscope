@@ -19,6 +19,11 @@ MODEL_FAMILY_ALIASES = {
     "gemma-4": "gemma4",
     "gemma-4-it": "gemma4",
     "gemma-4-26b-a4b-it": "gemma4",
+    "deepseek": "deepseek_v2",
+    "deepseek_v2": "deepseek_v2",
+    "deepseek-v2": "deepseek_v2",
+    "deepseek-v2-lite": "deepseek_v2",
+    "deepseek-v2-lite-chat": "deepseek_v2",
 }
 
 
@@ -46,6 +51,8 @@ def detect_model_family_from_path(model_path: str | None) -> str | None:
     if not model_path:
         return None
     model_name = Path(model_path).name.lower()
+    if "deepseek" in model_name:
+        return "deepseek_v2"
     if "gemma-4" in model_name or "gemma4" in model_name:
         return "gemma4"
     if "qwen3.6" in model_name or "qwen3.5" in model_name or "qwen3_5" in model_name:
@@ -58,6 +65,8 @@ def detect_model_family_from_path(model_path: str | None) -> str | None:
         return None
     model_type = str(payload.get("model_type", "")).lower()
     text_model_type = str(payload.get("text_config", {}).get("model_type", "")).lower()
+    if model_type in {"deepseek_v2", "deepseek"} or text_model_type in {"deepseek_v2", "deepseek"}:
+        return "deepseek_v2"
     if model_type in {"qwen3_5_moe", "qwen3_5_moe_text"} or text_model_type == "qwen3_5_moe_text":
         return "qwen3.6"
     if model_type in {"gemma4", "gemma4_text"} or text_model_type == "gemma4_text":

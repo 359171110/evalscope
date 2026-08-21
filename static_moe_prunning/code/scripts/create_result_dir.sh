@@ -15,6 +15,7 @@ METHOD=""
 TIMESTAMP=""
 SEED="42"
 DRY_RUN="false"
+PRUNING_RATIO_SHORTHAND="false"
 
 usage() {
     cat <<EOF
@@ -23,8 +24,9 @@ Usage:
     --inference vllm|transformer \
     --calibration WikiText128x2048|Mixed512x1024|CalibrationFree \
         [--model NAME] \
-        [--protocol quick9|full6_v1] \
+        [--protocol quick9|full6_v1|full8_v1] \
     --method NAME \
+        [--pruning-ratio 0|25|50] \
         [--pruning-ratio-label NAME] \
         [--pruning-ratio-percent NUMBER] \
     [--timestamp YYYYMMDDHHMM] \
@@ -75,6 +77,13 @@ while [[ $# -gt 0 ]]; do
             METHOD="$2"
             shift 2
             ;;
+        --pruning-ratio)
+            require_value "$@"
+            PRUNING_RATIO_SHORTHAND="true"
+            PRUNING_RATIO_LABEL="$2"
+            PRUNING_RATIO_PERCENT="$2"
+            shift 2
+            ;;
         --pruning-ratio-label)
             require_value "$@"
             PRUNING_RATIO_LABEL="$2"
@@ -110,8 +119,8 @@ case "$CALIBRATION" in
     WikiText128x2048|Mixed512x1024|CalibrationFree) ;;
     *) die "Unknown calibration identity '$CALIBRATION'." ;;
 esac
-[[ "$PROTOCOL" == "quick9" || "$PROTOCOL" == "full6_v1" ]] ||
-    die "Protocol must be quick9 or full6_v1."
+[[ "$PROTOCOL" == "quick9" || "$PROTOCOL" == "full6_v1" || "$PROTOCOL" == "full8_v1" ]] ||
+    die "Protocol must be quick9, full6_v1, or full8_v1."
 [[ "$MODEL" =~ ^[A-Za-z0-9]+([A-Za-z0-9.-]*[A-Za-z0-9])?$ ]] ||
     die "Model must contain only letters, numbers, dots, and hyphens."
 [[ "$METHOD" =~ ^[A-Za-z0-9]+([A-Za-z0-9-]*[A-Za-z0-9])?$ ]] ||
@@ -120,6 +129,10 @@ esac
     die "Pruning ratio label must contain only letters, numbers, and internal hyphens."
 [[ "$PRUNING_RATIO_PERCENT" =~ ^[0-9]+([.][0-9]+)?$ ]] ||
     die "Pruning ratio percent must be a non-negative number."
+if [[ "$PRUNING_RATIO_SHORTHAND" == "true" ]]; then
+    [[ "$PRUNING_RATIO_LABEL" == "0" || "$PRUNING_RATIO_LABEL" == "25" || "$PRUNING_RATIO_LABEL" == "50" ]] ||
+        die "Pruning ratio must be 0, 25 or 50."
+fi
 
 if [[ -z "$TIMESTAMP" ]]; then
     TIMESTAMP="$(date +%Y%m%d%H%M)"

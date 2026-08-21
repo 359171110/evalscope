@@ -185,6 +185,8 @@ def main() -> int:
         if source.suffix == ".safetensors" or source.name in {
             "config.json",
             "model.safetensors.index.json",
+            ".git",
+            ".cache",
         }:
             continue
         target = output_dir / source.name

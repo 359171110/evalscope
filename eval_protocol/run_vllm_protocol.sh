@@ -9,8 +9,9 @@ if [[ $# -lt 4 ]]; then
 Usage: $0 MODEL_ID API_URL METHOD EXPERIMENT_DIR
 
 Required environment:
-  PROTOCOL=quick9|full6_v1
-  PYTHON_BIN, ARC_PATH, HELLASWAG_PATH, WINOGRANDE_PATH, GSM8K_PATH, MATH_500_PATH, MMLU_PATH
+  PROTOCOL=quick9|full6_v1|full8_v1
+  PYTHON_BIN, DATASET_ROOT or ARC_PATH, HELLASWAG_PATH, WINOGRANDE_PATH,
+  GSM8K_PATH, MATH_500_PATH, MMLU_PATH; full8_v1 also needs HUMANEVAL_PATH, MBPP_PATH
 
 Optional:
   DATASETS=arc,hellaswag
@@ -24,6 +25,12 @@ API_URL=$2
 METHOD=$3
 EXPERIMENT_DIR=$4
 PROTOCOL="${PROTOCOL:-quick9}"
+
+# env.sh is the frozen path contract; re-source so DATASET_ROOT / *_PATH survive launcher env gaps.
+KEEP_PROTOCOL="$PROTOCOL"
+# shellcheck disable=SC1091
+source "$ROOT/eval_protocol/env.sh"
+export PROTOCOL="$KEEP_PROTOCOL"
 
 ARGS=(
     "$PYTHON_BIN" "$ROOT/eval_protocol/run_vllm_protocol.py"

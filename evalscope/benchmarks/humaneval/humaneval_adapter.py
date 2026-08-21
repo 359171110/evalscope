@@ -96,6 +96,12 @@ class HumanevalAdapter(CodeExecutionSandboxMixin, DefaultDataAdapter):
         blocks = re.findall(r'```\w*\n(.*?)```', text, re.DOTALL)
         if len(blocks) >= 1:
             text = blocks[0]
+        # Chat models often emit a leading space (ByteLevel Ġ after "Assistant:").
+        # Official HumanEval concatenates prompt + completion; a leading space
+        # before `def`/`import` makes the second definition indented and fails.
+        stripped = text.lstrip(' \t')
+        if stripped.startswith(('def ', 'async def ', 'from ', 'import ', '@')):
+            return stripped
         return text
 
     def match_score(

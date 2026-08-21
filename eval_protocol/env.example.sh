@@ -11,7 +11,7 @@ export PYTHONPATH="${ROOT}:${CODE_ROOT}${PYTHONPATH:+:$PYTHONPATH}"
 # Python used by EvalScope launchers and protocol tools.
 export PYTHON_BIN="${PYTHON_BIN:-python3}"
 
-# Unified vLLM env for Gemma4, Qwen3-30B-A3B, and Qwen3.6-35B-A3B.
+# Unified vLLM env for Gemma4, Qwen3-30B-A3B, Qwen3.6-35B-A3B, and DeepSeek-V2-Lite-Chat.
 # Recreate it on a new server with eval_protocol/envs/gemma4-vllm-cu128/setup_gemma4_vllm_cu128.sh
 export VLLM_ENV="${VLLM_ENV:-$HOME/.conda/envs/gemma4-vllm-cu128}"
 export VLLM_PYTHON="${VLLM_PYTHON:-$VLLM_ENV/bin/python}"
@@ -27,7 +27,8 @@ export HELLASWAG_PATH="${HELLASWAG_PATH:-$DATASET_ROOT/hellaswag}"
 export WINOGRANDE_PATH="${WINOGRANDE_PATH:-$DATASET_ROOT/winogrande/winogrande_1.1.zip}"
 export GSM8K_PATH="${GSM8K_PATH:-$DATASET_ROOT/gsm8k}"
 export MATH_500_PATH="${MATH_500_PATH:-$DATASET_ROOT/math_500}"
-export MMLU_PATH="${MMLU_PATH:-$DATASET_ROOT/mmlu}"
+export HUMANEVAL_PATH="${HUMANEVAL_PATH:-$DATASET_ROOT/humaneval}"
+export MBPP_PATH="${MBPP_PATH:-$DATASET_ROOT/mbpp}"
 
 export PROTOCOL="${PROTOCOL:-quick9}"
 export SEED="${SEED:-42}"

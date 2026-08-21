@@ -18,7 +18,7 @@
 
 - `result/` 下的历史实验
 - `**/experiments/`、`**/checkpoints/`、`*.pt`、`*.safetensors`
-- 基座模型，例如 Qwen3-30B-A3B / Qwen3.6-35B-A3B / Gemma4-26B-A4B
+- 基座模型，例如 Qwen3-30B-A3B / Qwen3.6-35B-A3B / Gemma4-26B-A4B-it / DeepSeek-V2-Lite-Chat
 - Quick9 六个数据集的本地副本
 
 ## 2. 强制原则
@@ -36,7 +36,7 @@ git clone git@github.com:359171110/evalscope.git
 cd evalscope
 pip install -e .
 
-# Recreate the frozen vLLM env (Gemma4 / Qwen3 / Qwen3.6, CUDA 12.8).
+# Recreate the frozen vLLM env (Gemma4 / Qwen3 / Qwen3.6 / DeepSeek-V2-Lite, CUDA 12.8).
 bash eval_protocol/envs/gemma4-vllm-cu128/setup_gemma4_vllm_cu128.sh
 
 cp eval_protocol/env.example.sh eval_protocol/env.sh
@@ -55,6 +55,8 @@ source eval_protocol/env.sh
 | `GSM8K_PATH` | GSM8K，0-shot |
 | `MATH_500_PATH` | MATH-500 |
 | `MMLU_PATH` | 本地 MMLU CSV 目录 |
+| `HUMANEVAL_PATH` | HumanEval（`full8_v1`） |
+| `MBPP_PATH` | MBPP `full` split（`full8_v1`，默认 3-shot） |
 
 启动任务前检查 GPU 和已有进程：
 
@@ -83,6 +85,7 @@ ARC -> HellaSwag -> WinoGrande -> GSM8K -> MATH-500 -> MMLU
 | --- | --- | --- | --- |
 | `quick9` | 冻结的快速横向比较 | 子集抽样：600 / 1000 / 400 / 128 / 100 / 570，共 2798 | ARC 2048，HellaSwag 512，WinoGrande 1024，GSM8K 2048，MATH-500 4096，MMLU 2048 |
 | `full6_v1` | 正式全量确认 | 六个数据集全部样本：3548 / 10042 / 1267 / 1319 / 500 / 14042，共 30718 | 与 Quick9 相同。截断的是每条样本的生成长度，不是评测条数 |
+| `full8_v1` | 正式全量确认 + 代码 | `full6_v1` 再加上 HumanEval 164、MBPP 500，共 31382 | HumanEval / MBPP `max_tokens=1024`；其余与 `full6_v1` 相同 |
 
 `full6_v1` 不传 `--limit`，跑完整 split。每个数据集仍设置 `max_tokens`，避免无限生成。不要把 Quick9 分数和 full6_v1 分数并排当成同一协议。
 
@@ -92,6 +95,7 @@ ARC -> HellaSwag -> WinoGrande -> GSM8K -> MATH-500 -> MMLU
 
 - `eval_protocol/quick9.json`
 - `eval_protocol/full6_v1.json`
+- `eval_protocol/full8_v1.json`
 
 ## 5. 结果目录命名
 
@@ -160,6 +164,17 @@ PROTOCOL="$PROTOCOL" bash eval_protocol/run_vllm_protocol.sh \
 
 无法被标准 vLLM 表达的异构宽度，才允许 `transformer` profile runtime，并在 manifest 里写明原因。
 
+当前冻结 vLLM 路径接入的 Dense 目标（`openai_api` 必须用带 chat template 的 Instruct/Chat 权重，不要用 base）：
+
+| `MODEL_NAME` | Hugging Face repo | vLLM architecture | 典型 GPU |
+| --- | --- | --- | ---: |
+| `Qwen330BA3BInstruct` | `Qwen/Qwen3-30B-A3B-Instruct-2507` | `Qwen3MoeForCausalLM` | 1 |
+| `Qwen36-35B-A3B` | `Qwen/Qwen3.6-35B-A3B` | `Qwen3_5MoeForConditionalGeneration` | 2 |
+| `Gemma4-26B-A4B-it` | `google/gemma-4-26B-A4B-it` | `Gemma4ForConditionalGeneration` | 1 |
+| `DeepSeek-V2-Lite-Chat` | `deepseek-ai/DeepSeek-V2-Lite-Chat` | `DeepseekV2ForCausalLM` | 1 |
+
+`DeepSeek-V2-Lite` base 没有 chat template，不能走本协议的 chat completions。Serving 时保留 `--trust-remote-code`，并用 `--generation-config vllm` 覆盖仓库自带的 `temperature=0.3`。`--max-model-len 8192` 必须显式设置：checkpoint 的 `max_position_embeddings` 是 163840。
+
 ## 7. 汇总
 
 ```bash
@@ -176,7 +191,13 @@ WATCH_SECONDS=0 bash scripts/watch_eval_reports.sh
 STATIC_MOE_PRUNING_FRAMEWORK_MANUAL.md
 ```
 
-WikiText128x2048 + `full6_v1` 的方法入口：
+WikiText128x2048 + `full8_v1` 的方法入口：
 
-- ENP：`TENP/README.md`，`TENP/run_enp_wikitext128x2048.sh`，`TENP/run_gemma4_enp_wikitext128x2048.sh`
-- Wanda：`Wanda/README.md`，`Wanda/run_wikitext128x2048_full6.sh`
+- ENP：`TENP/readme.md`，`TENP/run_wikitext128x2048_full8.sh`
+- Wanda：`Wanda/readme.md`，`Wanda/run_wikitext128x2048_full8.sh`
+
+CalibrationFree + `full8_v1` 的方法入口：
+
+- AIMER-Mix：`AIMER_Mix/readme.md`，`AIMER_Mix/run_calibration_free_full8.sh`
+- Product：`Product/readme.md`，`Product/run_calibration_free_full8.sh`
+- Geom：`Geom/readme.md`，`Geom/run_calibration_free_full8.sh`

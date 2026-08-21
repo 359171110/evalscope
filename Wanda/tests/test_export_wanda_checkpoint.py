@@ -29,6 +29,48 @@ def write_checkpoint(model_path: Path, family: str) -> tuple[dict[str, torch.Ten
             tensors[f"{prefix}.gate_proj.weight"] = torch.arange(width * 4).reshape(width, 4).float() + expert_id
             tensors[f"{prefix}.up_proj.weight"] = torch.arange(width * 4).reshape(width, 4).float() + 1000 + expert_id
             tensors[f"{prefix}.down_proj.weight"] = torch.arange(width * 4).reshape(4, width).float() + 2000 + expert_id
+    elif family == "deepseek":
+        width = 64
+        config = {
+            "model_type": "deepseek_v2",
+            "hidden_size": 4,
+            "hidden_act": "silu",
+            "moe_intermediate_size": width,
+            "num_hidden_layers": 2,
+            "n_routed_experts": 2,
+            "n_shared_experts": 2,
+            "num_experts_per_tok": 1,
+            "first_k_dense_replace": 1,
+        }
+        tensors = {
+            "model.layers.0.mlp.gate_proj.weight": torch.full((8, 4), 9.0),
+            "model.layers.1.mlp.gate.weight": torch.ones(2, 4),
+            "model.layers.1.mlp.shared_experts.gate_proj.weight": torch.full((width * 2, 4), -3.0),
+            "model.layers.1.mlp.shared_experts.up_proj.weight": torch.full((width * 2, 4), -4.0),
+            "model.layers.1.mlp.shared_experts.down_proj.weight": torch.full((4, width * 2), -5.0),
+        }
+        for expert_id in range(2):
+            prefix = f"model.layers.1.mlp.experts.{expert_id}"
+            tensors[f"{prefix}.gate_proj.weight"] = torch.arange(width * 4).reshape(width, 4).float() + expert_id
+            tensors[f"{prefix}.up_proj.weight"] = torch.arange(width * 4).reshape(width, 4).float() + 1000 + expert_id
+            tensors[f"{prefix}.down_proj.weight"] = torch.arange(width * 4).reshape(4, width).float() + 2000 + expert_id
+        (model_path / "configuration_deepseek.py").write_text(
+            "class DeepseekV2Config:\n"
+            "    def __init__(\n"
+            "        self,\n"
+            "        moe_intermediate_size = 1407,\n"
+            "        n_shared_experts = None,\n"
+            "    ):\n"
+            "        self.moe_intermediate_size = moe_intermediate_size\n"
+            "        self.n_shared_experts = n_shared_experts\n",
+            encoding="utf-8",
+        )
+        (model_path / "modeling_deepseek.py").write_text(
+            "if config.n_shared_experts is not None:\n"
+            "            intermediate_size = config.moe_intermediate_size * config.n_shared_experts\n"
+            "            self.shared_experts = None\n",
+            encoding="utf-8",
+        )
     else:
         model_type = "gemma4_text" if family == "gemma4" else "qwen3_5_moe_text"
         text_config = {
@@ -69,10 +111,11 @@ def write_checkpoint(model_path: Path, family: str) -> tuple[dict[str, torch.Ten
 
 
 def write_artifacts(model_path: Path, artifact_dir: Path, family: str, block_size: int) -> tuple[Path, Path]:
-    width = 64 if family == "gemma4" else 128
+    width = 64 if family in {"gemma4", "deepseek"} else 128
+    layer_id = 1 if family == "deepseek" else 0
     ranking = torch.stack((torch.arange(width - 1, -1, -1), torch.arange(width)))
     table = {
-        0: {
+        layer_id: {
             "ranked_indices": ranking,
             "block_relative_scores": torch.ones(2, width // block_size),
             "block_coverage_scores": torch.full((2, width // block_size), block_size / width),
@@ -104,7 +147,7 @@ def write_artifacts(model_path: Path, artifact_dir: Path, family: str, block_siz
         "calibration_split": "train",
         "calibration_frozen_before_evaluation": True,
         "test_metrics_used_for_profile": False,
-        "layer_ids": [0],
+        "layer_ids": [1 if family == "deepseek" else 0],
         "num_layers": 1,
         "num_experts": 2,
         "num_blocks": width // block_size,
@@ -177,3 +220,31 @@ def test_export_qwen36_preserves_shared_expert(tmp_path: Path, monkeypatch) -> N
         assert torch.equal(handle.get_tensor(shared_name), source[shared_name])
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     assert config["text_config"]["moe_intermediate_size"] == 64
+
+
+def test_export_deepseek_slices_routed_and_keeps_fused_shared_width(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    output, source = run_export(tmp_path, monkeypatch, "deepseek", 32)
+    retained = torch.arange(63, 31, -1)
+    dense_name = "model.layers.0.mlp.gate_proj.weight"
+    shared_name = "model.layers.1.mlp.shared_experts.gate_proj.weight"
+    routed_name = "model.layers.1.mlp.experts.0.gate_proj.weight"
+    with safe_open(output / "model.safetensors", framework="pt", device="cpu") as handle:
+        exported_routed = handle.get_tensor(routed_name)
+        assert torch.equal(handle.get_tensor(dense_name), source[dense_name])
+        assert torch.equal(handle.get_tensor(shared_name), source[shared_name])
+        assert tuple(exported_routed.shape) == (32, 4)
+        assert torch.equal(exported_routed, source[routed_name].index_select(0, retained))
+    config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+    manifest = json.loads((output / "pruning_export_manifest.json").read_text(encoding="utf-8"))
+    assert config["moe_intermediate_size"] == 32
+    assert config["n_shared_experts"] == 2
+    assert config["shared_expert_intermediate_size"] == 128
+    assert manifest["method"] == "wanda_grouped"
+    assert manifest["export_layout"] == "slice_uniform_width"
+    assert manifest["exported_shared_expert_intermediate_size"] == 128
+    assert "self.shared_expert_intermediate_size = shared_expert_intermediate_size" in (
+        output / "configuration_deepseek.py"
+    ).read_text(encoding="utf-8")

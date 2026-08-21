@@ -199,13 +199,20 @@ def build_channel_table(raw_scores: torch.Tensor, block_size: int, eps: float = 
     }
 
 
-def validate_rankings(table: dict[int, dict[str, object]], num_layers: int, num_experts: int, width: int) -> None:
+def validate_rankings(
+    table: dict[int, dict[str, object]],
+    num_layers: int,
+    num_experts: int,
+    width: int,
+    layer_ids: tuple[int, ...] | list[int] | None = None,
+) -> None:
     """Require a full, duplicate-free channel permutation for every expert."""
 
-    if set(map(int, table)) != set(range(num_layers)):
-        raise ValueError("Ranking table does not cover every model layer.")
+    expected_ids = list(range(int(num_layers)) if layer_ids is None else [int(layer_id) for layer_id in layer_ids])
+    if set(map(int, table)) != set(expected_ids):
+        raise ValueError("Ranking table does not cover every requested MoE layer.")
     expected = torch.arange(width)
-    for layer_id in range(num_layers):
+    for layer_id in expected_ids:
         ranking = table[layer_id]["ranked_indices"]
         if not isinstance(ranking, torch.Tensor) or tuple(ranking.shape) != (num_experts, width):
             raise ValueError(f"Layer {layer_id} ranking has an invalid shape.")

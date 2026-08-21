@@ -3,13 +3,14 @@
 本文档定义静态 MoE 剪枝框架的扩展、校准、评测和结果管理规范。当前已冻结并完成
 正式评测的基线模型为 Qwen3-30B-A3B-Instruct-2507；PP-Frozen-v1 已增加 Gemma4
 26B-A4B 和 Qwen3.6-35B-A3B 的 profile/export 适配。当前冻结的快速横向比较协议为
-Quick9，正式全量确认协议为 `full6_v1`。新服务器移植、环境变量和可执行协议定义见：
+Quick9，正式全量确认协议为 `full6_v1`，带 HumanEval/MBPP 的代码扩展协议为 `full8_v1`。新服务器移植、环境变量和可执行协议定义见：
 
 ```text
 eval_protocol/README.md
 eval_protocol/env.example.sh
 eval_protocol/quick9.json
 eval_protocol/full6_v1.json
+eval_protocol/full8_v1.json
 ```
 
 ## 1. 强制原则
@@ -33,7 +34,7 @@ eval_protocol/full6_v1.json
   拼接分数或直接运行其他汇总器来绕过该脚本的协议校验。只有第 12 节定义的例外场景才允许
   使用其他工具，并且必须明确说明例外原因和未覆盖的校验项。
 
-## 2. 环境初始化
+## 2. 环境初始化（根据具体服务器不同各自有差异，具体情况具体分析）！！！！！！
 
 ```bash
 cd /data01/home/xinpei.gao/evalscope
@@ -71,11 +72,11 @@ ps -eo pid,ppid,pgid,sid,stat,etime,args |
 
 | 字段 | 允许值或格式 |
 | --- | --- |
-| 目标模型 | `Qwen330BA3BInstruct`；适配中：`Gemma4-26B-A4B`、`Qwen3.6-35B-A3B` |
+| 目标模型 | `Qwen330BA3BInstruct`、`Gemma4-26B-A4B`、`Qwen3.6-35B-A3B`、`DeepSeek-V2-Lite-Chat` |
 | 剪枝率 | `25`、`50` |
 | 推理方式 | `vllm`、`transformer` |
 | 校准集 | `WikiText128x2048`、`Mixed512x1024`；无数据校准方法使用 `CalibrationFree` |
-| 评测协议 | `quick9` |
+| 评测协议 | `quick9`、`full6_v1`、`full8_v1` |
 | 方法名称 | 由方法所在文件夹名称提取，对方法做消融时要体现出消融参数；仅允许字母、数字和连字符，不能包含空格或下划线 |
 | 时间戳 | `YYYYMMDDHHMM`，使用任务首次启动时间 |
 | 随机数种子 | `42` |
@@ -246,8 +247,8 @@ PYTHONPATH="$ROOT:$CODE_ROOT" "$PYTHON_BIN" PP/export_uniform_moe.py \
 4. 在 `generate_downstream_comparison.py` 的 `VARIANT_ORDER` 中加入显示顺序。
 
 复杂方法可以像 `WICK/run_wick_quick9.sh` 或
-`TENP/run_qwen3_enp_tenp_reproduction.sh` 一样使用专用 launcher，但仍必须遵守本手册的
-结果根目录、命名和 Quick9 协议。
+`TENP/run_one_model_full8.sh` 一样使用专用 launcher，但仍必须遵守本手册的
+结果根目录、命名和评测协议。
 
 ### 5.5 测试门禁
 

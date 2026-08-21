@@ -60,6 +60,7 @@ git -C "$VLLM_SRC" fetch --tags origin
 git -C "$VLLM_SRC" checkout --detach "$VLLM_COMMIT"
 git -C "$VLLM_SRC" reset --hard "$VLLM_COMMIT"
 git -C "$VLLM_SRC" apply --whitespace=nowarn "$SCRIPT_DIR/patches/vllm-cu128-py310.patch"
+git -C "$VLLM_SRC" apply --whitespace=nowarn "$SCRIPT_DIR/patches/deepseek_shared_width.patch"
 cp "$SCRIPT_DIR/patches/glibc_compat.cpp" "$VLLM_SRC/csrc/glibc_compat.cpp"
 
 "${PIP[@]}" install -e "$VLLM_SRC" --no-build-isolation

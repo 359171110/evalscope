@@ -97,3 +97,34 @@ def test_qwen36_adapter_identifies_only_packed_routed_tensors(tmp_path: Path) ->
     assert adapter.architecture.branch_topology == "gated_shared"
     assert adapter.architecture.tensor_codec == "packed"
     assert adapter.architecture.width_for_pruning(0.5) == 256
+
+
+def test_deepseek_v2_adapter_skips_dense_first_layer_and_aligns_25_50(tmp_path: Path) -> None:
+    write_config(
+        tmp_path, {
+            "model_type": "deepseek_v2",
+            "hidden_size": 2048,
+            "hidden_act": "silu",
+            "moe_intermediate_size": 1408,
+            "num_hidden_layers": 27,
+            "n_routed_experts": 64,
+            "n_shared_experts": 2,
+            "num_experts_per_tok": 6,
+            "first_k_dense_replace": 1,
+        }
+    )
+    weight_map = {
+        "model.layers.1.mlp.gate.weight": "model.safetensors",
+        "model.layers.1.mlp.experts.0.gate_proj.weight": "model.safetensors",
+        "model.layers.1.mlp.experts.0.up_proj.weight": "model.safetensors",
+        "model.layers.1.mlp.experts.0.down_proj.weight": "model.safetensors",
+    }
+
+    adapter = WandaModelAdapter.from_checkpoint(tmp_path, weight_map)
+
+    assert adapter.architecture.model_family == "deepseek_v2"
+    assert adapter.architecture.moe_layer_ids()[0] == 1
+    assert adapter.architecture.channel_alignment == 32
+    assert adapter.architecture.width_for_pruning(0.25) == 1056
+    assert adapter.architecture.width_for_pruning(0.5) == 704
+    assert adapter.gate_name(1, 2) == "model.layers.1.mlp.experts.2.gate_proj.weight"

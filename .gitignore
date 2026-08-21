@@ -126,6 +126,7 @@ result.png
 result.jpg
 result.mp4
 /result/
+/results/
 *.itag
 
 # Local overlay env and scratch

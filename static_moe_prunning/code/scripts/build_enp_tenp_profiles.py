@@ -273,37 +273,69 @@ def patch_enp_tenp_collection(model, accumulator: EnpTenpAccumulator):
         if binding.kind == "mlp":
             top_k = int(binding.top_k)
             norm_topk_prob = bool(binding.norm_topk_prob)
+            router_name = type(binding.router).__name__ if binding.router is not None else ""
 
-            def _forward(
-                self,
-                hidden_states,
-                _layer_idx=layer_idx,
-                _top_k=top_k,
-                _norm=norm_topk_prob,
-            ):
-                batch, sequence, hidden_dim = hidden_states.shape
-                flat = hidden_states.reshape(-1, hidden_dim)
-                router_logits, gate, selected = route_qwen3_topk(
-                    self.gate,
-                    flat,
-                    top_k=_top_k,
-                    norm_topk_prob=_norm,
-                )
-                output = accumulator.update_and_compute_output(
-                    _layer_idx,
-                    flat,
-                    self.experts,
-                    selected,
-                    gate,
-                )
-                shared = compute_optional_shared_expert_output(
-                    flat,
-                    shared_expert=getattr(self, "shared_expert", None),
-                    shared_expert_gate=getattr(self, "shared_expert_gate", None),
-                )
-                if shared is not None:
-                    output = output + shared
-                return output.reshape(batch, sequence, hidden_dim), router_logits
+            if router_name == "MoEGate" or hasattr(binding.router, "n_routed_experts"):
+
+                def _forward(
+                    self,
+                    hidden_states,
+                    _layer_idx=layer_idx,
+                ):
+                    routed = self.gate(hidden_states)
+                    if not (isinstance(routed, tuple) and len(routed) >= 2):
+                        raise ValueError("DeepSeek MoEGate must return top-k indices and weights.")
+                    selected, gate = routed[0], routed[1]
+                    flat = hidden_states.reshape(-1, hidden_states.shape[-1])
+                    output = accumulator.update_and_compute_output(
+                        _layer_idx,
+                        flat,
+                        self.experts,
+                        selected,
+                        gate,
+                    )
+                    output = output.reshape_as(hidden_states)
+                    shared = compute_optional_shared_expert_output(
+                        hidden_states,
+                        shared_experts=getattr(self, "shared_experts", None),
+                    )
+                    if shared is not None:
+                        output = output + shared
+                    return output
+
+            else:
+
+                def _forward(
+                    self,
+                    hidden_states,
+                    _layer_idx=layer_idx,
+                    _top_k=top_k,
+                    _norm=norm_topk_prob,
+                ):
+                    batch, sequence, hidden_dim = hidden_states.shape
+                    flat = hidden_states.reshape(-1, hidden_dim)
+                    router_logits, gate, selected = route_qwen3_topk(
+                        self.gate,
+                        flat,
+                        top_k=_top_k,
+                        norm_topk_prob=_norm,
+                    )
+                    output = accumulator.update_and_compute_output(
+                        _layer_idx,
+                        flat,
+                        self.experts,
+                        selected,
+                        gate,
+                    )
+                    shared = compute_optional_shared_expert_output(
+                        flat,
+                        shared_expert=getattr(self, "shared_expert", None),
+                        shared_expert_gate=getattr(self, "shared_expert_gate", None),
+                        shared_experts=getattr(self, "shared_experts", None),
+                    )
+                    if shared is not None:
+                        output = output + shared
+                    return output.reshape(batch, sequence, hidden_dim), router_logits
 
         else:
 

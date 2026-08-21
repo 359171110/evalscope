@@ -13,6 +13,44 @@ from evalscope.utils.logger import get_logger
 
 logger = get_logger()
 
+
+def _mbpp_exec_target(payload: str, result: Any) -> None:
+    """Execute one MBPP completion in a spawned subprocess.
+
+    Must be module-level so ``multiprocessing`` spawn can pickle it.
+    """
+
+    import contextlib
+    import io
+
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            exec_globals: Dict[str, Any] = {}
+            exec(payload, exec_globals)
+        result.append({'status': 'success'})
+    except Exception as exc:  # noqa: BLE001
+        result.append({'status': 'error', 'error': str(exc)})
+
+
+def execute_mbpp_locally(code: str, timeout: float) -> Dict[str, Any]:
+    """Run MBPP assertions in a subprocess when Docker sandbox is unavailable."""
+
+    import multiprocessing
+
+    ctx = multiprocessing.get_context('spawn')
+    manager = ctx.Manager()
+    result = manager.list()
+    process = ctx.Process(target=_mbpp_exec_target, args=(code, result))
+    process.start()
+    process.join(timeout=timeout + 1)
+    if process.is_alive():
+        process.kill()
+        process.join()
+        return {'status': 'timeout', 'error': 'Code execution timed out.'}
+    if not result:
+        return {'status': 'timeout', 'error': 'Code execution returned no result.'}
+    return dict(result[0])
+
 FEWSHOT_PROMPT = """You are an expert Python programmer, and here is your task: Write a function to find the similar elements from the given two tuple lists. Your code should pass these tests:\n\nassert similar_elements((3, 4, 5, 6),(5, 7, 4, 10)) == (4, 5)\nassert similar_elements((1, 2, 3, 4),(5, 4, 3, 7)) == (3, 4)\nassert similar_elements((11, 12, 14, 13),(17, 15, 14, 13)) == (13, 14)\n[BEGIN]\ndef similar_elements(test_tup1, test_tup2):\r\n  res = tuple(set(test_tup1) & set(test_tup2))\r\n  return (res)\n[DONE]
 You are an expert Python programmer, and here is your task: Write a python function to identify non-prime numbers. Your code should pass these tests:
 
@@ -147,10 +185,21 @@ class MBPPAdapter(CodeExecutionSandboxMixin, DefaultDataAdapter):
     def postprocess_completion(cls, completion, stop_words=['\nassert', '\n"""']):
         from evalscope.utils.code_utils import extract_code_from_freeform_completion
 
+        completion = completion.lstrip(' \t')
         if '[DONE]' in completion:
             completion = completion[:completion.index('[DONE]')]
+        completion = completion.strip()
+        # Some chat models wrap the solution in square brackets: [def foo(): ...]
+        if completion.startswith('[') and 'def ' in completion:
+            end = completion.rfind(']')
+            if end > 0:
+                inner = completion[1:end].strip()
+                if inner.startswith('def ') or inner.startswith('import '):
+                    completion = inner
 
         code, _ = extract_code_from_freeform_completion(completion, 'python', first_block_only=True)
+        if not str(code).strip() and 'def ' in completion:
+            code = completion
 
         for st in stop_words:
             index = code.find(st)
@@ -162,25 +211,21 @@ class MBPPAdapter(CodeExecutionSandboxMixin, DefaultDataAdapter):
         self, original_prediction: str, filtered_prediction: str, reference: str, task_state: TaskState
     ) -> Score:
 
-        if not self.use_sandbox:
-            raise RuntimeError(
-                f'{self.pretty_name} benchmark requires sandboxed code '
-                'execution for safety reasons. Please set use_sandbox in the task configuration.'
-            )
-
         score = Score(
             extracted_prediction=filtered_prediction,
             prediction=original_prediction,
         )
         problem = task_state.metadata
         completion = filtered_prediction
-        # Append test cases to the completion
-        for test in task_state.metadata['test_list']:
+        for test in problem['test_list']:
             completion += '\n' + test + '\n'
 
-        res = self.execute_code_in_sandbox(code=completion, timeout=self.review_timeout, language='python')
-        passed = res.get('status') == 'success'
-        # Set score values
+        if self.use_sandbox:
+            res = self.execute_code_in_sandbox(code=completion, timeout=self.review_timeout, language='python')
+            passed = res.get('status') == 'success'
+        else:
+            res = execute_mbpp_locally(completion, float(self.review_timeout))
+            passed = res.get('status') == 'success'
         score.value = {'acc': passed}
         score.metadata = {'task_id': problem['task_id'], 'timeout': self.review_timeout, 'execution_result': res}
         score.main_score_name = 'acc'

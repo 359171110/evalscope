@@ -51,7 +51,7 @@ def load_qwen3_moe(
         "torch_dtype": "auto",
         "trust_remote_code": True,
     }
-    if family == "qwen3":
+    if family == "qwen3" or family == "deepseek_v2":
         model_class = AutoModelForCausalLM
     elif family == "qwen3.6":
         model_class = getattr(transformers, "Qwen3_5MoeForConditionalGeneration", None)
