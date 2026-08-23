@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,7 +19,9 @@ class PseudoSource:
     ``order`` is a complete channel permutation with shape
     ``[layers, experts, channels]``. ``coverage`` and ``stability`` are optional
     ``[layers, experts]`` confidence signals in
-    ``[0, 1]``. Missing confidence defaults to one; a missing source is represented
+    ``[0, 1]``. ``hit_counts`` is an optional non-negative
+    ``[layers, experts]`` LayerProp routing count used for adaptive LP+PRP
+    mixing. Missing confidence defaults to one; a missing source is represented
     by ``None`` at the caller and is not treated as a failure.
     """
 
@@ -26,6 +29,7 @@ class PseudoSource:
     order: torch.Tensor
     coverage: torch.Tensor | None = None
     stability: torch.Tensor | None = None
+    hit_counts: torch.Tensor | None = None
     base_weight: float = 1.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -49,6 +53,11 @@ class PseudoSource:
                     raise ValueError(f"{self.name} {label} must have shape {(layers, experts)}")
                 if not bool(torch.isfinite(values).all()) or bool(((values < 0) | (values > 1)).any()):
                     raise ValueError(f"{self.name} {label} must be finite and in [0, 1]")
+        if self.hit_counts is not None:
+            if self.hit_counts.shape != (layers, experts):
+                raise ValueError(f"{self.name} hit_counts must have shape {(layers, experts)}")
+            if not bool(torch.isfinite(self.hit_counts).all()) or bool((self.hit_counts < 0).any()):
+                raise ValueError(f"{self.name} hit_counts must be finite and non-negative")
         if self.base_weight < 0:
             raise ValueError("Pseudo source base_weight must be non-negative")
 
@@ -69,6 +78,13 @@ class AIMERMixPlusConfig:
     disagreement_penalty: float = 0.05
     rank_temperature: float = 1.0
     epsilon: float = 1.0e-8
+    # When True the keep-set is ranked only by pseudo sources (LayerProp/PRP/PP).
+    # AIMER-Mix still supplies a fallback order if no source is active.
+    ignore_base: bool = False
+    # Mix LayerProp and PRP per expert as λ S_LP + (1-λ) S_PRP,
+    # λ = N / (N + tau), where N is LayerProp hit count.
+    adaptive_lp_prp: bool = False
+    layerprop_tau: float = 8.0
     source_weights: tuple[tuple[str, float], ...] = (
         ("pp", 1.0),
         ("prp", 1.0),
@@ -92,6 +108,8 @@ class AIMERMixPlusConfig:
             raise ValueError("agreement_bonus and disagreement_penalty must be non-negative")
         if self.rank_temperature <= 0.0 or self.epsilon <= 0.0:
             raise ValueError("rank_temperature and epsilon must be positive")
+        if self.layerprop_tau <= 0.0:
+            raise ValueError("layerprop_tau must be positive")
 
     def weight_for(self, name: str) -> float:
         return dict(self.source_weights).get(name, 0.0)
@@ -118,6 +136,33 @@ def rank_percentiles_from_order(order: torch.Tensor) -> torch.Tensor:
     return ranks
 
 
+def layerprop_mix_lambda(hit_count: float, tau: float) -> float:
+    """Coverage-gated LayerProp share: λ = N / (N + τ). Uncovered experts get λ = 0."""
+
+    if tau <= 0.0:
+        raise ValueError("tau must be positive")
+    count = float(hit_count)
+    if not math.isfinite(count):
+        return 1.0
+    count = max(count, 0.0)
+    return count / (count + tau)
+
+
+def _layerprop_hit_count(source: PseudoSource, layer_id: int, expert_id: int) -> float:
+    if source.hit_counts is not None:
+        return float(source.hit_counts[layer_id, expert_id].clamp_min(0.0).item())
+    if source.coverage is None:
+        return 0.0
+    coverage = float(source.coverage[layer_id, expert_id].item())
+    if coverage <= 0.0:
+        return 0.0
+    # Old caches only stored binary coverage. Treat a covered expert as
+    # well-supported so λ → 1, and an uncovered expert as λ = 0.
+    if coverage <= 1.0:
+        return float("inf")
+    return coverage
+
+
 def _confidence(source: PseudoSource, layer_id: int, expert_id: int, device: torch.device) -> float:
     confidence = torch.tensor(1.0, dtype=torch.float32, device=device)
     if source.coverage is not None:
@@ -128,6 +173,8 @@ def _confidence(source: PseudoSource, layer_id: int, expert_id: int, device: tor
 
 
 def _rescue_size(retained_channels: int, config: AIMERMixPlusConfig) -> int:
+    if config.ignore_base:
+        return retained_channels
     requested = max(config.minimum_boundary_channels, round(retained_channels * config.boundary_fraction))
     maximum = max(config.minimum_boundary_channels, round(retained_channels * config.maximum_boundary_fraction))
     return min(retained_channels - 1, maximum, requested)
@@ -138,6 +185,9 @@ def _fuse_one_expert(
     retained_channels: int,
     sources: list[tuple[PseudoSource, torch.Tensor, float]],
     config: AIMERMixPlusConfig,
+    *,
+    layer_id: int = 0,
+    expert_id: int = 0,
 ) -> tuple[torch.Tensor, dict[str, Any]]:
     channels = int(base_rank.numel())
     rescue = _rescue_size(retained_channels, config)
@@ -154,6 +204,20 @@ def _fuse_one_expert(
             "agreement_mass": 0.0,
         }
 
+    adaptive_weights: dict[str, float] | None = None
+    layerprop_lambda = None
+    layerprop_hits = None
+    if config.adaptive_lp_prp:
+        present = {source.name for source, _ranks, _confidence in sources}
+        if "layerprop" in present and "prp" in present:
+            layerprop_source = next(source for source, _ranks, _confidence in sources if source.name == "layerprop")
+            layerprop_hits = _layerprop_hit_count(layerprop_source, layer_id, expert_id)
+            layerprop_lambda = layerprop_mix_lambda(layerprop_hits, config.layerprop_tau)
+            adaptive_weights = {
+                "layerprop": float(layerprop_lambda),
+                "prp": float(1.0 - layerprop_lambda),
+            }
+
     # Pseudo sources compete only for the boundary budget. Their score remains
     # capable of selecting channels outside the AIMER-Mix boundary, which is
     # the intended Gemma4 recovery path.
@@ -163,10 +227,17 @@ def _fuse_one_expert(
     source_confidences: list[float] = []
     active_names: list[str] = []
     for source, ranks, confidence in sources:
-        nominal_weight = float(config.weight_for(source.name) * source.base_weight)
-        if nominal_weight <= 0.0 or confidence <= 0.0:
-            continue
-        weight = nominal_weight * float(confidence)
+        if adaptive_weights is not None and source.name in adaptive_weights:
+            nominal_weight = float(adaptive_weights[source.name])
+            if nominal_weight <= 0.0:
+                continue
+            weight = nominal_weight
+            confidence = 1.0
+        else:
+            nominal_weight = float(config.weight_for(source.name) * source.base_weight)
+            if nominal_weight <= 0.0 or confidence <= 0.0:
+                continue
+            weight = nominal_weight * float(confidence)
         ranks = ranks.clamp_min(0.0).pow(1.0 / config.rank_temperature)
         source_ranks.append(ranks)
         source_confidences.append(float(confidence))
@@ -202,30 +273,35 @@ def _fuse_one_expert(
                 ).to(torch.float32)
                 pair_count += 1
         agreement = agreement / float(max(pair_count, 1))
-    disagreement = (
-        torch.stack([
-            confidence * ranks + (1.0 - confidence) * base_rank
-            for ranks, confidence in zip(source_ranks, source_confidences)
-        ]).std(dim=0, unbiased=False)
-        if len(source_ranks) > 1
-        else torch.zeros_like(base_rank)
-    )
+    if len(source_ranks) > 1:
+        if config.ignore_base:
+            stacked = torch.stack(source_ranks)
+        else:
+            stacked = torch.stack([
+                confidence * ranks + (1.0 - confidence) * base_rank
+                for ranks, confidence in zip(source_ranks, source_confidences)
+            ])
+        disagreement = stacked.std(dim=0, unbiased=False)
+    else:
+        disagreement = torch.zeros_like(base_rank)
+    base_w = 0.0 if config.ignore_base else config.base_boundary_weight
     fused_scores = (
-        config.base_boundary_weight * base_rank
+        base_w * base_rank
         + config.pseudo_weight * pseudo_scores
         + config.agreement_bonus * agreement
         - config.disagreement_penalty * disagreement
     )
 
-    # Keep the AIMER core fixed, then let all remaining channels compete for
-    # the rescue budget. This is what allows LayerProp/PRP to recover channels
-    # that AIMER-Mix placed below the original Top-K boundary.
+    # Keep the AIMER core fixed unless ignore_base, then let remaining channels
+    # compete for the rescue budget. LayerProp/PRP can recover channels that
+    # AIMER-Mix placed below the original Top-K boundary.
     core_mask = torch.zeros(channels, dtype=torch.bool, device=base_rank.device)
-    core_mask[core] = True
+    if core.numel() > 0:
+        core_mask[core] = True
     candidates = torch.where(~core_mask)[0]
     candidate_order = candidates[torch.argsort(fused_scores[candidates], descending=True, stable=True)]
     selected_rescue = candidate_order[:rescue]
-    selected = torch.cat((core, selected_rescue))
+    selected = selected_rescue if core.numel() == 0 else torch.cat((core, selected_rescue))
     selected_mask = torch.zeros(channels, dtype=torch.bool, device=base_rank.device)
     selected_mask[selected] = True
     tail = base_order[~selected_mask[base_order]]
@@ -239,6 +315,8 @@ def _fuse_one_expert(
         "selected_rescue": selected_rescue,
         "base_rescue": base_rescue,
         "swap_count": int((~torch.isin(selected_rescue, base_rescue)).sum().item()),
+        "layerprop_lambda": layerprop_lambda,
+        "layerprop_hits": None if layerprop_hits is None or not math.isfinite(float(layerprop_hits)) else float(layerprop_hits),
     }
 
 
@@ -293,6 +371,8 @@ def build_plus_ranking(
                 int(retained_channels),
                 expert_sources,
                 config,
+                layer_id=layer_id,
+                expert_id=expert_id,
             )
             layer_orders.append(order)
             layer_diagnostics.append({"layer_id": layer_id, "expert_id": expert_id, **info})
@@ -314,6 +394,9 @@ def build_plus_ranking(
             "agreement_bonus": config.agreement_bonus,
             "disagreement_penalty": config.disagreement_penalty,
             "source_weights": dict(config.source_weights),
+            "ignore_base": bool(config.ignore_base),
+            "adaptive_lp_prp": bool(config.adaptive_lp_prp),
+            "layerprop_tau": float(config.layerprop_tau),
         },
         "diagnostics": diagnostics,
     }

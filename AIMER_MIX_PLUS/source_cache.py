@@ -83,13 +83,15 @@ def _layer_coverage(
     return values
 
 
-def _tensor_confidence(
+def _tensor_field(
     payload: dict[str, Any],
     key: str,
     layer_ids: Sequence[int],
     num_experts: int,
+    *,
+    unit_interval: bool,
 ) -> torch.Tensor | None:
-    """Read optional ``[layer, expert]`` confidence tensors from a cache."""
+    """Read optional ``[layer, expert]`` tensors from a cache."""
 
     raw = payload.get(key)
     if raw is None:
@@ -105,9 +107,20 @@ def _tensor_confidence(
         values = raw.index_select(0, torch.tensor(layer_ids)).to(dtype=torch.float32, device="cpu")
     else:
         raise ValueError(f"Pseudo source {key} must have shape [layers, experts]")
-    if not bool(torch.isfinite(values).all()) or bool(((values < 0) | (values > 1)).any()):
+    if not bool(torch.isfinite(values).all()) or bool((values < 0).any()):
+        raise ValueError(f"Pseudo source {key} must be finite and non-negative")
+    if unit_interval and bool((values > 1).any()):
         raise ValueError(f"Pseudo source {key} must be finite and in [0, 1]")
     return values
+
+
+def _tensor_confidence(
+    payload: dict[str, Any],
+    key: str,
+    layer_ids: Sequence[int],
+    num_experts: int,
+) -> torch.Tensor | None:
+    return _tensor_field(payload, key, layer_ids, num_experts, unit_interval=True)
 
 
 def load_pseudo_source(
@@ -157,11 +170,13 @@ def load_pseudo_source(
     stability_values = _tensor_confidence(payload, "stability", layer_ids, num_experts)
     if stability_values is None:
         stability_values = torch.full_like(coverage, float(stability))
+    hit_counts = _tensor_field(payload, "hit_counts", layer_ids, num_experts, unit_interval=False)
     source = PseudoSource(
         name=name,
         order=order,
         coverage=coverage,
         stability=stability_values,
+        hit_counts=hit_counts,
         base_weight=float(base_weight),
         metadata={
             "cache_path": str(path),

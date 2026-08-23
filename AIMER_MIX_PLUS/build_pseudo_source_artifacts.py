@@ -14,7 +14,7 @@ from AIMER_Mix.mix_core import file_sha256
 from AIMER_Mix.model_adapter import AIMERMixModelAdapter
 
 
-SourceMethod = Literal["pp", "prp"]
+SourceMethod = Literal["pp", "prp", "layerprop"]
 ScoreMode = Literal["activation", "output"]
 
 
@@ -287,10 +287,14 @@ def route_residual_candidates(
 
     architecture = adapter.architecture
     eps = float(adapter.text_config.get("rms_norm_eps", 1.0e-6))
+    device = residuals.device
     if architecture.model_family == "gemma4":
         prefix = f"model.language_model.layers.{layer_id}.router"
-        scale = load_tensor(model_path, weight_map, f"{prefix}.scale").float()
-        per_expert_scale = load_tensor(model_path, weight_map, f"{prefix}.per_expert_scale").float().reshape(-1)
+        scale = load_tensor(model_path, weight_map, f"{prefix}.scale").to(device=device, dtype=torch.float32)
+        per_expert_scale = load_tensor(model_path, weight_map, f"{prefix}.per_expert_scale").to(
+            device=device,
+            dtype=torch.float32,
+        ).reshape(-1)
         route_rows = residuals.float() * torch.rsqrt(
             residuals.float().square().mean(-1, keepdim=True) + eps
         )
@@ -331,40 +335,40 @@ def select_routed_previous_write_probes(
     if count < 1:
         raise ValueError("probe_count must be positive")
     hidden_size = architecture.hidden_size
-    best_scores = torch.full((architecture.num_experts, count), -torch.inf, dtype=torch.float32)
-    best_probes = torch.zeros((architecture.num_experts, count, hidden_size), dtype=torch.float32)
-    routed_counts = torch.zeros(architecture.num_experts, dtype=torch.long)
-    found_any = False
+    device = router.device
+    chunks = []
     for chunk in write_chunks:
         if chunk.ndim != 2 or chunk.shape[1] != hidden_size:
             raise ValueError("previous write chunks must have shape [candidates, hidden]")
-        positive = F.normalize(chunk.float() * previous_gamma.unsqueeze(0), dim=1, eps=eps)
-        candidates = torch.cat((positive, -positive), dim=0)
-        selected, route_weights = route_residual_candidates(
-            model_path=model_path,
-            weight_map=weight_map,
-            adapter=adapter,
-            layer_id=layer_id,
-            residuals=candidates,
-            router=router,
-            expert_norm=expert_norm,
-        )
-        found_any = True
-        for expert_id in range(architecture.num_experts):
-            rows, slots = torch.where(selected == expert_id)
-            if rows.numel() == 0:
-                continue
-            routed_counts[expert_id] += rows.numel()
-            values = route_weights[rows, slots].float()
-            probes = candidates.index_select(0, rows)
-            combined_scores = torch.cat((best_scores[expert_id], values), dim=0)
-            combined_probes = torch.cat((best_probes[expert_id], probes), dim=0)
-            keep = min(count, int(combined_scores.numel()))
-            scores, positions = torch.topk(combined_scores, k=keep, largest=True, sorted=True)
-            best_scores[expert_id, :keep] = scores
-            best_probes[expert_id, :keep] = combined_probes.index_select(0, positions)
-    if not found_any:
+        chunks.append(chunk.to(device=device, dtype=torch.float32))
+    if not chunks:
         raise ValueError("No previous-layer write directions are available")
+    # One batched route is equivalent to the old per-chunk merge-topk: both keep
+    # the strongest ``probe_count`` hits per target expert across all writes.
+    positive = F.normalize(torch.cat(chunks, dim=0) * previous_gamma.to(device).unsqueeze(0), dim=1, eps=eps)
+    candidates = torch.cat((positive, -positive), dim=0)
+    selected, route_weights = route_residual_candidates(
+        model_path=model_path,
+        weight_map=weight_map,
+        adapter=adapter,
+        layer_id=layer_id,
+        residuals=candidates,
+        router=router.to(device=device, dtype=torch.float32),
+        expert_norm=expert_norm.to(device=device, dtype=torch.float32),
+    )
+    best_scores = torch.full((architecture.num_experts, count), -torch.inf, dtype=torch.float32, device=device)
+    best_probes = torch.zeros((architecture.num_experts, count, hidden_size), dtype=torch.float32, device=device)
+    routed_counts = torch.zeros(architecture.num_experts, dtype=torch.long, device=device)
+    for expert_id in range(architecture.num_experts):
+        rows, slots = torch.where(selected == expert_id)
+        if rows.numel() == 0:
+            continue
+        routed_counts[expert_id] = rows.numel()
+        values = route_weights[rows, slots].float()
+        keep = min(count, int(values.numel()))
+        scores, positions = torch.topk(values, k=keep, largest=True, sorted=True)
+        best_scores[expert_id, :keep] = scores
+        best_probes[expert_id, :keep] = candidates.index_select(0, rows.index_select(0, positions))
     valid_counts = torch.isfinite(best_scores).sum(1)
     return best_probes, best_scores, torch.minimum(valid_counts, routed_counts)
 
@@ -400,19 +404,22 @@ def collect_pp_scores(
     top_q: int,
     probe_signs: str,
     score_mode: ScoreMode,
+    device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     architecture = adapter.architecture
-    router = load_tensor(model_path, weight_map, adapter.router_name(layer_id)).float()
+    device = torch.device(device)
+    router = load_tensor(model_path, weight_map, adapter.router_name(layer_id)).to(device=device, dtype=torch.float32)
     norm_name, norm = load_first_tensor(
         model_path,
         weight_map,
         expert_norm_candidates(adapter, layer_id),
     )
-    neighbors = router_neighbors(router, neighbor_count)
+    norm = norm.to(device=device, dtype=torch.float32)
+    neighbors = router_neighbors(router.cpu(), neighbor_count)
     scores = []
     for expert_id, gate, up, down in iter_expert_weights(model_path, weight_map, adapter, layer_id):
-        raw = router.index_select(0, neighbors[expert_id])
-        probes = rms_norm_rows(raw, norm.float(), float(adapter.text_config.get("rms_norm_eps", 1.0e-6)))
+        raw = router.index_select(0, neighbors[expert_id].to(device))
+        probes = rms_norm_rows(raw, norm, float(adapter.text_config.get("rms_norm_eps", 1.0e-6)))
         if probe_signs == "positive-negative":
             probes = torch.cat((probes, -probes), dim=0)
         elif probe_signs != "positive":
@@ -420,9 +427,9 @@ def collect_pp_scores(
         scores.append(
             aggregate_channel_scores(
                 probes,
-                gate,
-                up,
-                down,
+                gate.to(device=device, dtype=torch.float32),
+                up.to(device=device, dtype=torch.float32),
+                down.to(device=device, dtype=torch.float32),
                 activation=architecture.activation,
                 top_q=top_q,
                 score_mode=score_mode,
@@ -447,15 +454,18 @@ def collect_prp_scores(
     top_q: int,
     score_mode: ScoreMode,
     fallback_pp: torch.Tensor,
+    device: torch.device | str = "cpu",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, Any]]:
     architecture = adapter.architecture
+    device = torch.device(device)
     previous_layer = int(layer_id) - 1
     norm_name, norm = load_first_tensor(
         model_path,
         weight_map,
         expert_norm_candidates(adapter, layer_id),
     )
-    router = load_tensor(model_path, weight_map, adapter.router_name(layer_id)).float()
+    norm = norm.to(device=device, dtype=torch.float32)
+    router = load_tensor(model_path, weight_map, adapter.router_name(layer_id)).to(device=device, dtype=torch.float32)
     previous_gamma = load_previous_write_gamma(
         model_path,
         weight_map,
@@ -470,9 +480,9 @@ def collect_prp_scores(
             adapter=adapter,
             layer_id=layer_id,
             router=router,
-            expert_norm=norm.float(),
+            expert_norm=norm,
             write_chunks=iter_previous_write_chunks(model_path, weight_map, adapter, previous_layer),
-            previous_gamma=previous_gamma,
+            previous_gamma=previous_gamma.to(device=device, dtype=torch.float32),
             probe_count=probe_count,
         )
     except ValueError as error:
@@ -491,13 +501,13 @@ def collect_prp_scores(
         if count == 0:
             scores.append(fallback_pp[expert_id].cpu())
             continue
-        expert_probes = rms_norm_rows(probes[expert_id, :count], norm.float(), eps)
+        expert_probes = rms_norm_rows(probes[expert_id, :count], norm, eps)
         scores.append(
             aggregate_channel_scores(
                 expert_probes,
-                gate,
-                up,
-                down,
+                gate.to(device=device, dtype=torch.float32),
+                up.to(device=device, dtype=torch.float32),
+                down.to(device=device, dtype=torch.float32),
                 activation=architecture.activation,
                 top_q=top_q,
                 score_mode=score_mode,
@@ -528,6 +538,7 @@ def build_source_payload(
     layer_metadata: list[dict[str, Any]],
     score_mode: ScoreMode,
     top_q: int,
+    hit_counts: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     architecture = adapter.architecture
     return {
@@ -555,6 +566,11 @@ def build_source_payload(
             "coverage": coverage.float().cpu(),
             "stability": stability.float().cpu(),
             "layers": layer_metadata,
+            **(
+                {"hit_counts": hit_counts.float().cpu()}
+                if hit_counts is not None
+                else {}
+            ),
         },
     }
 
@@ -569,6 +585,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top-q", type=int, default=4)
     parser.add_argument("--probe-signs", choices=("positive", "positive-negative"), default="positive")
     parser.add_argument("--score-mode", choices=("activation", "output"), default="activation")
+    parser.add_argument(
+        "--device",
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="Device for PP/PRP matmuls. Use CUDA_VISIBLE_DEVICES to pin a GPU.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -582,6 +603,9 @@ def main() -> int:
     weight_map = load_weight_map(model_path)
     adapter = AIMERMixModelAdapter.from_checkpoint(model_path, weight_map)
     architecture = adapter.architecture
+    device = torch.device(args.device)
+    if device.type == "cuda":
+        print(f"pseudo_source_device={device} name={torch.cuda.get_device_name(device)}", flush=True)
     tables: dict[int, dict[str, torch.Tensor | int]] = {}
     coverage_rows = []
     stability_rows = []
@@ -596,6 +620,7 @@ def main() -> int:
             top_q=int(args.top_q),
             probe_signs=args.probe_signs,
             score_mode=args.score_mode,
+            device=device,
         )
         if args.method == "pp":
             scores, coverage, stability, metadata = pp_scores, pp_coverage, pp_stability, pp_metadata
@@ -609,6 +634,7 @@ def main() -> int:
                 top_q=int(args.top_q),
                 score_mode=args.score_mode,
                 fallback_pp=pp_scores,
+                device=device,
             )
         tables[layer_id] = scores_to_table(scores, architecture.channel_alignment)
         coverage_rows.append(coverage)

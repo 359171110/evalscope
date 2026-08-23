@@ -329,6 +329,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pp-weight", type=float, default=1.0)
     parser.add_argument("--prp-weight", type=float, default=1.0)
     parser.add_argument("--layerprop-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--ignore-base",
+        action="store_true",
+        help="Rank the keep-set from pseudo sources only; ignore AIMER-Mix scores.",
+    )
+    parser.add_argument(
+        "--adaptive-lp-prp",
+        action="store_true",
+        help="Mix LayerProp and PRP per expert with λ = N / (N + tau).",
+    )
+    parser.add_argument(
+        "--layerprop-tau",
+        type=float,
+        default=8.0,
+        help="Smoothing count for adaptive LayerProp share. Default: 8.",
+    )
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -394,6 +410,9 @@ def main() -> int:
             ("prp", float(args.prp_weight)),
             ("layerprop", float(args.layerprop_weight)),
         ),
+        ignore_base=bool(args.ignore_base),
+        adaptive_lp_prp=bool(args.adaptive_lp_prp),
+        layerprop_tau=float(args.layerprop_tau),
     )
     orders, diagnostics = build_plus_ranking_from_order(
         base_orders,
