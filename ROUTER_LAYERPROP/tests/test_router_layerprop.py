@@ -15,7 +15,12 @@ from ROUTER_LAYERPROP.core import (
     output_energy_scores,
     recoverability_swap_refinement,
 )
-from ROUTER_LAYERPROP.planner import build_expert_plan
+from ROUTER_LAYERPROP.planner import build_expert_plan, build_layer_plan
+from ROUTER_LAYERPROP.propagation import (
+    pack_refresh_probes,
+    refresh_source_targets,
+    run_refresh_propagation,
+)
 
 
 class FakeRMSNorm(nn.Module):
@@ -129,6 +134,64 @@ def test_probe_variants_never_use_self_partner() -> None:
         assert torch.isfinite(probes[expert]).all()
 
 
+def test_refresh_schedule_uses_nearest_source_within_horizon() -> None:
+    schedule = refresh_source_targets(tuple(range(13)), stride=4, horizon=8)
+    assert schedule == {
+        4: (4, 5, 6, 7),
+        8: (8, 9, 10, 11),
+        12: (12,),
+    }
+
+
+def test_refresh_probe_pack_uses_fixed_interleaved_budget() -> None:
+    adapter = adapter_for_model(_fake_qwen3())
+    config = LayerPropConfig(
+        num_pseudo_tokens=16,
+        sequence_length=4,
+        probe_variants=2,
+        channel_multiple=2,
+    )
+    bank = pack_refresh_probes(adapter, adapter.layers()[0], config, scale=1.0)
+    assert bank.shape == (4, 4, 6)
+    assert torch.isfinite(bank).all()
+
+
+def test_refresh_propagation_runs_each_origin_once() -> None:
+    adapter = adapter_for_model(_fake_qwen3())
+    adapter.model.model.layers = nn.ModuleList([adapter.layers()[0] for _ in range(6)])
+    calls = []
+
+    def run_window(
+        bank: torch.Tensor,
+        source_layer_id: int,
+        target_layer_ids: tuple[int, ...],
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        calls.append((source_layer_id, target_layer_ids))
+        return bank, {layer_id: bank + float(layer_id) for layer_id in target_layer_ids}
+
+    adapter.run_refresh_window = run_window
+    config = LayerPropConfig(
+        num_pseudo_tokens=16,
+        sequence_length=4,
+        probe_variants=2,
+        refresh_stride=2,
+        refresh_horizon=2,
+        max_rows_per_expert_per_origin=8,
+        channel_multiple=2,
+    )
+    rows = run_refresh_propagation(
+        adapter,
+        tuple(range(6)),
+        config,
+        scales={layer_id: 1.0 for layer_id in range(6)},
+        fallback_scale=1.0,
+    )
+    assert calls == [(2, (2, 3)), (4, (4, 5))]
+    assert set(rows) == {"refresh_2", "refresh_4"}
+    assert set(rows["refresh_2"]) == {2, 3}
+    assert set(rows["refresh_4"]) == {4, 5}
+
+
 def test_qwen3_adapter_uses_raw_residual_norm_coordinate() -> None:
     model = _fake_qwen3()
     adapter = adapter_for_model(model)
@@ -166,3 +229,21 @@ def test_plan_falls_back_for_uncovered_expert() -> None:
     )
     assert plan["retained_width"] == 2
     assert plan["compensation_accepted"] is False
+
+
+def test_local_rows_only_fill_insufficient_long_coverage() -> None:
+    config = LayerPropConfig(min_train_rows=3, min_valid_rows=2, channel_multiple=2)
+    down = torch.randn(2, 4, 6)
+    long = {0: torch.randn(4, 6), 1: torch.randn(1, 6)}
+    local = {0: torch.randn(4, 6), 1: torch.randn(4, 6)}
+    valid = {0: torch.randn(3, 6), 1: torch.randn(3, 6)}
+    plans = build_layer_plan(
+        source_rows={"source0_long": long},
+        validation_source_rows={"source0_long": valid, "target_local": local},
+        fallback_source_rows={"target_local": local},
+        down_proj=down,
+        retained_channels=2,
+        config=config,
+    )
+    assert plans[0]["train_source"] == "source0_long"
+    assert plans[1]["train_source"] == "source0_long+target_local"

@@ -69,7 +69,9 @@ class MoEAdapter(ABC):
         """Build local probes in the raw residual coordinate system."""
 
         directions = self.router_effective_direction(layer)
-        return build_router_probes(directions, variants=variants, scale=scale)
+        probes = build_router_probes(directions, variants=variants, scale=scale)
+        gate_up, _down = self.expert_weights(layer)
+        return probes.to(device=gate_up.device, dtype=gate_up.dtype)
 
     def local_rows(
         self,
@@ -113,6 +115,148 @@ class MoEAdapter(ABC):
         if attention is None:
             raise AttributeError("Decoder layer does not expose self_attn")
         return attention
+
+    def _text_root(self) -> torch.nn.Module:
+        """Return the native text decoder root shared by Qwen wrappers."""
+
+        root = getattr(self.model, "model", self.model)
+        return getattr(root, "language_model", root)
+
+    def _refresh_context(self, hidden_states: torch.Tensor) -> dict[str, Any]:
+        """Prepare native masks and rotary embeddings for a stateless Qwen segment."""
+
+        if self.metadata.family == "qwen3":
+            from transformers.models.qwen3_moe import modeling_qwen3_moe as modeling
+
+            root = self._text_root()
+            position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device).unsqueeze(0)
+            attention_mask = torch.ones(
+                hidden_states.shape[:2], dtype=torch.long, device=hidden_states.device
+            )
+            causal_mask = modeling.create_causal_mask(
+                config=root.config,
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                position_ids=position_ids,
+            )
+            position_embeddings = root.rotary_emb(hidden_states, position_ids=position_ids)
+            return {
+                "attention_mask": causal_mask,
+                "position_ids": position_ids,
+                "position_embeddings": position_embeddings,
+            }
+        if self.metadata.family == "qwen3.6":
+            from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as modeling
+
+            root = self._text_root()
+            batch, sequence = hidden_states.shape[:2]
+            all_position_ids = torch.arange(hidden_states.shape[1], device=hidden_states.device)
+            all_position_ids = all_position_ids.view(1, 1, -1).expand(4, batch, -1)
+            text_position_ids = all_position_ids[0]
+            rotary_position_ids = all_position_ids[1:]
+            attention_mask = torch.ones((batch, sequence), dtype=torch.long, device=hidden_states.device)
+            causal_mask = modeling.create_causal_mask(
+                config=root.config,
+                inputs_embeds=hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                position_ids=text_position_ids,
+            )
+            position_embeddings = root.rotary_emb(hidden_states, rotary_position_ids)
+            return {
+                "attention_mask": causal_mask,
+                "linear_attention_mask": None,
+                "position_ids": text_position_ids,
+                "position_embeddings": position_embeddings,
+            }
+        raise NotImplementedError(f"Refresh propagation is not implemented for {self.metadata.family}")
+
+    def run_refresh_window(
+        self,
+        bank: torch.Tensor,
+        source_layer_id: int,
+        target_layer_ids: tuple[int, ...],
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor]]:
+        """Run one Qwen refresh bank once and capture every target in its horizon."""
+
+        if not self.supports_refresh_propagation:
+            raise NotImplementedError(f"Refresh propagation is not implemented for {self.metadata.family}")
+        targets = tuple(sorted(set(int(layer_id) for layer_id in target_layer_ids)))
+        if not targets:
+            raise ValueError("target_layer_ids must not be empty")
+        if int(source_layer_id) > targets[0]:
+            raise ValueError("source_layer_id must not exceed any target layer")
+        root = self._text_root()
+        source_layer = root.layers[int(source_layer_id)]
+        context = self._refresh_context(bank)
+        captured_raw: dict[int, torch.Tensor] = {}
+        handles = []
+        if int(source_layer_id) in targets:
+            captured_raw[int(source_layer_id)] = bank.detach()
+        for target_layer_id in targets:
+            if target_layer_id == int(source_layer_id):
+                continue
+            target_module = self.capture_module(root.layers[target_layer_id])
+
+            def capture_hook(
+                module: torch.nn.Module,
+                args: tuple[Any, ...],
+                layer_id: int = target_layer_id,
+            ) -> None:
+                del module
+                if args and isinstance(args[0], torch.Tensor) and layer_id not in captured_raw:
+                    captured_raw[layer_id] = args[0].detach()
+
+            handles.append(target_module.register_forward_pre_hook(capture_hook))
+        normalized = source_layer.post_attention_layernorm(bank)
+        try:
+            source_output = source_layer.mlp(normalized)
+            if isinstance(source_output, (tuple, list)):
+                source_output = source_output[0]
+            hidden_states = bank + source_output
+            for layer_id in range(int(source_layer_id) + 1, targets[-1] + 1):
+                layer = root.layers[layer_id]
+                if self.metadata.family == "qwen3":
+                    hidden_states = layer(
+                        hidden_states,
+                        attention_mask=context["attention_mask"],
+                        position_ids=context["position_ids"],
+                        past_key_values=None,
+                        use_cache=False,
+                        position_embeddings=context["position_embeddings"],
+                    )
+                else:
+                    layer_mask = (
+                        context["linear_attention_mask"]
+                        if getattr(layer, "layer_type", "full_attention") == "linear_attention"
+                        else context["attention_mask"]
+                    )
+                    hidden_states = layer(
+                        hidden_states,
+                        position_embeddings=context["position_embeddings"],
+                        attention_mask=layer_mask,
+                        position_ids=context["position_ids"],
+                        past_key_values=None,
+                    )
+        finally:
+            for handle in handles:
+                handle.remove()
+        missing = set(targets) - set(captured_raw)
+        if missing:
+            raise RuntimeError(f"Refresh window did not capture target layers: {sorted(missing)}")
+        return hidden_states, captured_raw
+
+    def run_refresh_segment(
+        self,
+        bank: torch.Tensor,
+        source_layer_id: int,
+        target_layer_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """Compatibility wrapper for one target within a refresh window."""
+
+        hidden_states, captured = self.run_refresh_window(bank, source_layer_id, (target_layer_id,))
+        return hidden_states, captured.get(int(target_layer_id))
 
     @property
     def supports_refresh_propagation(self) -> bool:
@@ -163,7 +307,7 @@ class MoEAdapter(ABC):
 
 
 class Qwen3MoeAdapter(MoEAdapter):
-    """Adapter for Qwen3's separate gate/up/down routed experts."""
+    """Adapter for Qwen3's packed or separate gate/up/down routed experts."""
 
     metadata = AdapterMetadata("qwen3", 0, 0, 0, 0, "silu", False, 64)
 
@@ -173,13 +317,20 @@ class Qwen3MoeAdapter(MoEAdapter):
         first = layers[0]
         mlp = self._mlp(first)
         experts = getattr(mlp, "experts")
-        first_expert = experts[0]
-        hidden_size = int(first_expert.gate_proj.weight.shape[1])
-        intermediate_size = int(first_expert.gate_proj.weight.shape[0])
+        packed = hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj")
+        if packed:
+            hidden_size = int(experts.gate_up_proj.shape[-1])
+            intermediate_size = int(experts.gate_up_proj.shape[1] // 2)
+            num_experts = int(experts.gate_up_proj.shape[0])
+        else:
+            first_expert = experts[0]
+            hidden_size = int(first_expert.gate_proj.weight.shape[1])
+            intermediate_size = int(first_expert.gate_proj.weight.shape[0])
+            num_experts = len(experts)
         gate = getattr(mlp, "gate")
         top_k = int(getattr(self.text_config(), "num_experts_per_tok", 1))
         self.metadata = AdapterMetadata(
-            "qwen3", hidden_size, len(experts), top_k, intermediate_size, "silu", False, 64
+            "qwen3", hidden_size, num_experts, top_k, intermediate_size, "silu", packed, 64
         )
 
     def layers(self) -> tuple[torch.nn.Module, ...]:
@@ -244,6 +395,8 @@ class Qwen3MoeAdapter(MoEAdapter):
 
     def expert_weights(self, layer: torch.nn.Module) -> tuple[torch.Tensor, torch.Tensor]:
         experts = self._mlp(layer).experts
+        if hasattr(experts, "gate_up_proj") and hasattr(experts, "down_proj"):
+            return experts.gate_up_proj.detach(), experts.down_proj.detach()
         gate_up = []
         down = []
         for expert in experts:
@@ -299,8 +452,8 @@ class Qwen35MoeAdapter(MoEAdapter):
 
     def _route_logits(self, layer: torch.nn.Module, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         router = self._mlp(layer).gate
-        scores = torch.sigmoid(logits.float())
-        weights, indices = torch.topk(scores, self.metadata.top_k, dim=-1)
+        probabilities = torch.softmax(logits.float(), dim=-1)
+        weights, indices = torch.topk(probabilities, self.metadata.top_k, dim=-1)
         norm_topk_prob = bool(
             getattr(self._mlp(layer), "norm_topk_prob", getattr(router, "norm_topk_prob", True))
         )

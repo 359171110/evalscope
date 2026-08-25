@@ -73,6 +73,7 @@ def build_expert_plan(
     retained_channels: int,
     config: LayerPropConfig,
     validation_rows: torch.Tensor | None = None,
+    selection_rows: torch.Tensor | None = None,
 ) -> dict[str, Any]:
     """Build one expert's keep set and accepted compensation tensor."""
 
@@ -93,7 +94,11 @@ def build_expert_plan(
         train_parts = []
         valid_parts = []
         for name in sorted(sources):
-            train, valid = _split_rows(sources[name], config.min_train_rows, config.min_valid_rows)
+            if validation_rows is not None and validation_rows.ndim == 2 and validation_rows.shape[0]:
+                train = sources[name]
+                valid = sources[name][:0]
+            else:
+                train, valid = _split_rows(sources[name], config.min_train_rows, config.min_valid_rows)
             if train.shape[0]:
                 train_parts.append(train / max(float(train.shape[0]) ** 0.5, 1.0))
             if valid.shape[0]:
@@ -103,7 +108,10 @@ def build_expert_plan(
         train_source = "+".join(sorted(sources))
     if validation_rows is not None and validation_rows.ndim == 2 and validation_rows.shape[0]:
         valid_rows = validation_rows.detach().float().cpu()
-    keep = choose_keep_channels(train_rows, down_proj, retained_channels, config)
+    keep_rows = train_rows
+    if selection_rows is not None and selection_rows.ndim == 2 and selection_rows.shape[0]:
+        keep_rows = selection_rows.detach().float().cpu()
+    keep = choose_keep_channels(keep_rows, down_proj, retained_channels, config)
     if valid_rows.shape[0] < config.min_valid_rows:
         compensation = CompensationResult(
             down=down_proj.float().index_select(1, keep),
@@ -146,6 +154,9 @@ def build_layer_plan(
     retained_channels: int,
     config: LayerPropConfig,
     validation_rows: dict[int, torch.Tensor] | None = None,
+    validation_source_rows: dict[str, dict[int, torch.Tensor]] | None = None,
+    fallback_source_rows: dict[str, dict[int, torch.Tensor]] | None = None,
+    selection_source_rows: dict[str, dict[int, torch.Tensor]] | None = None,
 ) -> dict[int, dict[str, Any]]:
     """Build plans for all experts in one packed routed layer."""
 
@@ -157,12 +168,47 @@ def build_layer_plan(
             source: rows.get(expert, torch.empty((0, down_proj.shape[-1]), device=down_proj.device))
             for source, rows in source_rows.items()
         }
+        fallback_used: set[str] = set()
+        train_count = sum(int(rows.shape[0]) for rows in expert_sources.values() if rows.ndim == 2)
+        if train_count < config.min_train_rows and fallback_source_rows is not None:
+            for source, rows_by_expert in fallback_source_rows.items():
+                rows = rows_by_expert.get(expert)
+                if rows is None or rows.ndim != 2 or rows.shape[0] == 0:
+                    continue
+                expert_sources[source] = rows
+                fallback_used.add(source)
+                train_count += int(rows.shape[0])
+                if train_count >= config.min_train_rows:
+                    break
+        if validation_source_rows is not None:
+            validation_parts = []
+            for source, rows_by_expert in validation_source_rows.items():
+                if source in fallback_used:
+                    continue
+                rows = rows_by_expert.get(expert)
+                if rows is not None and rows.ndim == 2 and rows.shape[0]:
+                    rows = rows.detach().float().cpu()
+                    validation_parts.append(rows / max(float(rows.shape[0]) ** 0.5, 1.0))
+            combined_validation = torch.cat(validation_parts, dim=0) if validation_parts else None
+        else:
+            combined_validation = None if validation_rows is None else validation_rows.get(expert)
+        if selection_source_rows is not None:
+            selection_parts = []
+            for rows_by_expert in selection_source_rows.values():
+                rows = rows_by_expert.get(expert)
+                if rows is not None and rows.ndim == 2 and rows.shape[0]:
+                    rows = rows.detach().float().cpu()
+                    selection_parts.append(rows / max(float(rows.shape[0]) ** 0.5, 1.0))
+            combined_selection = torch.cat(selection_parts, dim=0) if selection_parts else None
+        else:
+            combined_selection = None
         plans[expert] = build_expert_plan(
             source_rows=expert_sources,
             down_proj=down_proj[expert],
             retained_channels=retained_channels,
             config=config,
-            validation_rows=None if validation_rows is None else validation_rows.get(expert),
+            validation_rows=combined_validation,
+            selection_rows=combined_selection,
         )
     return plans
 

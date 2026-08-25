@@ -78,6 +78,8 @@ def _apply_packed(layer: torch.nn.Module, plans: dict[Any, Any], adapter: Any) -
     _set_parameter(experts, "down_proj", new_down)
     if hasattr(experts, "intermediate_size"):
         experts.intermediate_size = width
+    if hasattr(experts, "intermediate_dim"):
+        experts.intermediate_dim = width
 
 
 def _apply_separate(layer: torch.nn.Module, plans: dict[Any, Any], adapter: Qwen3MoeAdapter) -> None:
@@ -125,8 +127,10 @@ def export_checkpoint(model_path: Path, plan_path: Path, output_dir: Path) -> No
     for layer_key, plans in layer_plans.items():
         layer_id = int(layer_key)
         layer = adapter.layers()[layer_id]
-        if isinstance(adapter, Qwen3MoeAdapter):
+        if isinstance(adapter, Qwen3MoeAdapter) and not adapter.metadata.packed_experts:
             _apply_separate(layer, plans, adapter)
+        elif isinstance(adapter, Qwen3MoeAdapter):
+            _apply_packed(layer, plans, adapter)
         elif isinstance(adapter, (Qwen35MoeAdapter, Gemma4MoeAdapter)):
             _apply_packed(layer, plans, adapter)
         else:

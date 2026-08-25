@@ -10,6 +10,11 @@ from .core import (
     recoverability_swap_refinement,
     route_topk,
 )
+from .propagation import (
+    refresh_source_targets,
+    run_refresh_propagation,
+    run_router_long_propagation,
+)
 
 __all__ = [
     "LayerPropConfig",
@@ -20,4 +25,7 @@ __all__ = [
     "output_energy_scores",
     "recoverability_swap_refinement",
     "route_topk",
+    "refresh_source_targets",
+    "run_refresh_propagation",
+    "run_router_long_propagation",
 ]

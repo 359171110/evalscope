@@ -13,7 +13,13 @@ import torch
 from .adapters import adapter_for_model
 from .config import LayerPropConfig
 from .planner import build_layer_plan, plan_summary
-from .propagation import collect_local_rows, run_source0_propagation, supported_layer_ids
+from .propagation import (
+    collect_local_rows,
+    run_refresh_propagation,
+    run_router_long_propagation,
+    run_source0_propagation,
+    supported_layer_ids,
+)
 from .synthetic import embedding_probe_scale, synthetic_input_ids
 
 
@@ -39,6 +45,7 @@ def load_hf_model(model_path: Path, device: torch.device, dtype: torch.dtype) ->
 
 def _config_from_args(args: argparse.Namespace) -> LayerPropConfig:
     values = LayerPropConfig(
+        propagation_mode=args.propagation_mode,
         num_pseudo_tokens=args.num_pseudo_tokens,
         sequence_length=args.sequence_length,
         probe_variants=args.probe_variants,
@@ -66,8 +73,14 @@ def build_plan(model_path: Path, output_path: Path, args: argparse.Namespace) ->
     requested_width = args.retained_channels
     if requested_width is None:
         requested_width = round(adapter.metadata.intermediate_size * (1.0 - args.pruning_ratio))
-    retained_channels = max(adapter.metadata.channel_multiple, int(requested_width) // adapter.metadata.channel_multiple * adapter.metadata.channel_multiple)
-    retained_channels = min(retained_channels, adapter.metadata.intermediate_size - adapter.metadata.channel_multiple)
+    retained_channels = max(
+        config.channel_multiple,
+        int(requested_width) // config.channel_multiple * config.channel_multiple,
+    )
+    retained_channels = min(
+        retained_channels,
+        adapter.metadata.intermediate_size - config.channel_multiple,
+    )
     if retained_channels <= 0 or retained_channels >= adapter.metadata.intermediate_size:
         raise ValueError("retained width must be positive, aligned, and smaller than source width")
     input_ids = synthetic_input_ids(
@@ -83,24 +96,63 @@ def build_plan(model_path: Path, output_path: Path, args: argparse.Namespace) ->
         f"tokens={config.num_pseudo_tokens} sequence_length={config.sequence_length} retained={retained_channels}",
         flush=True,
     )
-    train_rows, valid_rows = run_source0_propagation(
-        model,
-        adapter,
-        input_ids,
-        layer_ids=layer_ids,
-        config=config,
-        device=device,
+    use_router_long = config.propagation_mode == "long_short" and adapter.supports_refresh_propagation
+    if use_router_long:
+        train_rows, valid_rows, layer_scales = run_router_long_propagation(
+            adapter,
+            layer_ids,
+            config,
+            scale,
+        )
+    else:
+        train_rows, valid_rows, layer_scales = run_source0_propagation(
+            model,
+            adapter,
+            input_ids,
+            layer_ids=layer_ids,
+            config=config,
+            device=device,
+        )
+    local_rows = collect_local_rows(adapter, layer_ids, config, layer_scales, scale)
+    refresh_rows = (
+        run_refresh_propagation(adapter, layer_ids, config, layer_scales, scale)
+        if config.propagation_mode == "long_short"
+        else {}
     )
-    local_rows = collect_local_rows(adapter, layer_ids, config, scale)
+    refresh_by_layer: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
+    for source_name, target_rows in refresh_rows.items():
+        for target_layer, rows in target_rows.items():
+            refresh_by_layer.setdefault(target_layer, {})[source_name] = rows
     plans: dict[int, dict[int, dict[str, Any]]] = {}
     for layer_id in layer_ids:
         gate_up, down = adapter.expert_weights(adapter.layers()[layer_id])
-        plans[layer_id] = build_layer_plan(
-            source_rows={
+        if use_router_long:
+            origin_rows: dict[str, dict[int, torch.Tensor]] = {
+                "source0_long": train_rows[layer_id],
+            }
+            selection_source_rows: dict[str, dict[int, torch.Tensor]] = {
                 "source0_long": train_rows[layer_id],
                 "target_local": local_rows[layer_id],
-            },
-            validation_rows=valid_rows[layer_id],
+            }
+            selection_source_rows.update(refresh_by_layer.get(layer_id, {}))
+            validation_source_rows: dict[str, dict[int, torch.Tensor]] = {
+                "source0_long": valid_rows[layer_id],
+                "target_local": local_rows[layer_id],
+            }
+            validation_source_rows.update(refresh_by_layer.get(layer_id, {}))
+        else:
+            origin_rows = {
+                "source0_long": train_rows[layer_id],
+                "target_local": local_rows[layer_id],
+            }
+            selection_source_rows = {}
+            validation_source_rows = {}
+        plans[layer_id] = build_layer_plan(
+            source_rows=origin_rows,
+            validation_rows=None if use_router_long else valid_rows[layer_id],
+            validation_source_rows=validation_source_rows if use_router_long else None,
+            fallback_source_rows={"target_local": local_rows[layer_id]} if use_router_long else None,
+            selection_source_rows=selection_source_rows if use_router_long else None,
             down_proj=down,
             retained_channels=retained_channels,
             config=config,
@@ -109,6 +161,7 @@ def build_plan(model_path: Path, output_path: Path, args: argparse.Namespace) ->
     payload: dict[str, Any] = {
         "schema_version": 1,
         "method": "router_conditioned_multi_origin_layerprop",
+        "propagation_mode": config.propagation_mode,
         "data_free": True,
         "model_path": str(model_path.resolve()),
         "model_family": adapter.metadata.family,
@@ -119,9 +172,27 @@ def build_plan(model_path: Path, output_path: Path, args: argparse.Namespace) ->
         "layers": plans,
         "summary": plan_summary(plans),
         "provenance": {
-            "probe_source": "router_region_directions_plus_deterministic_vocab_lattice",
+            "probe_source": (
+                "router_conditioned_source0_long_plus_stride_refresh_plus_target_local"
+                if use_router_long
+                else "router_region_directions_plus_deterministic_vocab_lattice"
+            ),
             "calibration_corpus": None,
             "source0_split": "sequence_order_train_valid",
+            "refresh_schedule": "stride_and_horizon_nearest_source" if refresh_rows else "disabled",
+            "refresh_origins": sorted(refresh_rows),
+            "refresh_supported": bool(adapter.supports_refresh_propagation),
+            "layer_scales": layer_scales,
+            "source0_origin": "router_conditioned_long_bank" if use_router_long else "vocab_lattice_native_forward",
+            "effective_mode": (
+                "long_short"
+                if refresh_rows
+                else "router_long_local"
+                if use_router_long
+                else "stable_fallback"
+                if config.propagation_mode == "long_short"
+                else "stable"
+            ),
             "shared_expert_pruned": False,
             "original_model_kept_untouched_during_planning": True,
         },
@@ -137,6 +208,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--output-plan", type=Path, required=True)
     parser.add_argument("--device", default="cuda")
+    parser.add_argument("--propagation-mode", choices=("stable", "long_short"), default="long_short")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--retained-channels", type=int)
     parser.add_argument("--pruning-ratio", type=float, default=0.5)

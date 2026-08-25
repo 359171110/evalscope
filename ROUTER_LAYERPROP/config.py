@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 class LayerPropConfig:
     """Data-free pruning settings shared by all supported model families."""
 
+    propagation_mode: str = "long_short"
     num_pseudo_tokens: int = 2048
     sequence_length: int = 32
     probe_variants: int = 8
@@ -31,6 +32,8 @@ class LayerPropConfig:
     def validate(self) -> None:
         """Validate settings before synthetic propagation or pruning."""
 
+        if self.propagation_mode not in {"stable", "long_short"}:
+            raise ValueError("propagation_mode must be 'stable' or 'long_short'")
         positive_ints = {
             "num_pseudo_tokens": self.num_pseudo_tokens,
             "sequence_length": self.sequence_length,
