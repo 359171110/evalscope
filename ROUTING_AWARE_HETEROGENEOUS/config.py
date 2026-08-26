@@ -12,6 +12,8 @@ class MethodConfig:
     natural_sequences: int = 96
     guided_sequences: int = 32
     sequence_length: int = 2048
+    calibration_batch_size: int = 1
+    generation_batch_size: int = 1
     max_samples_per_expert: int = 128
     min_samples_per_expert: int = 32
     safe_samples_per_expert: int = 8
@@ -30,6 +32,8 @@ class MethodConfig:
             raise ValueError("sequence budgets must be positive/non-negative")
         if self.sequence_length <= 0:
             raise ValueError("sequence_length must be positive")
+        if self.calibration_batch_size <= 0 or self.generation_batch_size <= 0:
+            raise ValueError("calibration and generation batch sizes must be positive")
         if not 0 < self.safe_samples_per_expert <= self.min_samples_per_expert <= self.max_samples_per_expert:
             raise ValueError("sample limits must satisfy safe <= min <= max")
         if self.anchor_candidates <= 0 or not 0.0 < self.retention <= 1.0:

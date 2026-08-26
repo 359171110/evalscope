@@ -30,6 +30,8 @@ PYTHONPATH="$PWD" /data01/home/xinpei.gao/.conda/envs/gemma4-vllm-cu128/bin/pyth
 
 The installed `transformers` version must expose the native model implementation used by the repository's `ROUTER_LAYERPROP` adapters. Keep sequence count and length modest when first validating a new checkpoint.
 
+The real-model path is intentionally memory conservative: calibration uses micro-batches (default `1`), hooks retain at most `max_samples_per_expert` expert-conditioned rows, backbone-only forward is used instead of allocating language-model logits, and generated sequences are moved back to CPU between batches. On a shared GPU, keep `--calibration-batch-size 1 --generation-batch-size 1` until the checkpoint has been validated.
+
 ## Checks
 
 ```bash

@@ -13,9 +13,10 @@ import torch
 class LayerTrace:
     """Native routing observations for one decoder layer and one token batch."""
 
-    expert_input: torch.Tensor
+    expert_input: torch.Tensor | None
     selected_experts: torch.Tensor
     routing_weights: torch.Tensor
+    expert_samples: dict[int, torch.Tensor] | None = None
 
 
 class ArchitectureAdapter(ABC):
@@ -42,7 +43,7 @@ class ArchitectureAdapter(ABC):
         """Return the device used for model statistics."""
 
     @abstractmethod
-    def collect(self, input_ids: torch.Tensor) -> tuple[LayerTrace, ...]:
+    def collect(self, input_ids: torch.Tensor, max_samples_per_expert: int = 128) -> tuple[LayerTrace, ...]:
         """Run native forward and return one trace per MoE layer."""
 
     @abstractmethod
@@ -109,7 +110,7 @@ class HuggingFaceAdapter(ArchitectureAdapter):
     def device(self) -> torch.device:
         return self._device
 
-    def collect(self, input_ids: torch.Tensor) -> tuple[LayerTrace, ...]:
+    def collect(self, input_ids: torch.Tensor, max_samples_per_expert: int = 128) -> tuple[LayerTrace, ...]:
         """Capture all layer expert inputs during one native forward."""
 
         self._traces = []
@@ -126,14 +127,35 @@ class HuggingFaceAdapter(ArchitectureAdapter):
                 raw = args[0]
                 expert_input = self.native_adapter.expert_input(layers[current_layer], raw)
                 indices, weights = self.native_adapter.route_from_captured(layers[current_layer], raw, expert_input)
+                compact_samples = {}
+                for expert_id in range(self.num_experts):
+                    positions = torch.nonzero(indices == expert_id, as_tuple=False)
+                    if positions.numel() > 0:
+                        compact_samples[expert_id] = expert_input.index_select(
+                            0, positions[:max_samples_per_expert, 0]
+                        ).detach()
                 self._traces.append(
-                    (current_layer, LayerTrace(expert_input.detach(), indices.detach(), weights.detach()))
+                    (
+                        current_layer,
+                        LayerTrace(
+                            None,
+                            indices.detach(),
+                            weights.detach(),
+                            compact_samples,
+                        ),
+                    )
                 )
 
             handles.append(module.register_forward_pre_hook(capture_hook))
         try:
             with torch.inference_mode():
-                self.model(input_ids=input_ids)
+                backbone = getattr(self.model, "model", None)
+                if backbone is None:
+                    raise AttributeError("Hugging Face causal LM does not expose a transformer backbone as .model")
+                try:
+                    backbone(input_ids=input_ids, use_cache=False, return_dict=False)
+                except TypeError:
+                    backbone(input_ids=input_ids, use_cache=False)
         finally:
             for handle in handles:
                 handle.remove()

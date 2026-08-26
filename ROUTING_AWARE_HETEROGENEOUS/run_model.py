@@ -19,6 +19,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--natural-sequences", type=int, default=96)
     parser.add_argument("--guided-sequences", type=int, default=32)
     parser.add_argument("--sequence-length", type=int, default=2048)
+    parser.add_argument("--calibration-batch-size", type=int, default=1)
+    parser.add_argument("--generation-batch-size", type=int, default=1)
     parser.add_argument("--retention", type=float, default=0.5)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
@@ -31,7 +33,14 @@ def _dtype(name: str) -> torch.dtype:
     return {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[name]
 
 
-def _natural_sequences(model: torch.nn.Module, tokenizer: object, count: int, length: int, device: torch.device) -> torch.Tensor:
+def _natural_sequences(
+    model: torch.nn.Module,
+    tokenizer: object,
+    count: int,
+    length: int,
+    device: torch.device,
+    batch_size: int,
+) -> torch.Tensor:
     """Generate self-sampled calibration sequences only."""
 
     bos = getattr(tokenizer, "bos_token_id", None)
@@ -39,16 +48,25 @@ def _natural_sequences(model: torch.nn.Module, tokenizer: object, count: int, le
         bos = getattr(tokenizer, "eos_token_id", None)
     if bos is None:
         raise ValueError("tokenizer needs bos_token_id or eos_token_id")
-    prompts = torch.full((count, 1), int(bos), dtype=torch.long, device=device)
-    with torch.inference_mode():
-        return model.generate(
-            input_ids=prompts,
-            max_new_tokens=max(1, length - 1),
-            do_sample=True,
-            temperature=1.0,
-            top_p=0.95,
-            pad_token_id=getattr(tokenizer, "pad_token_id", None) or int(bos),
-        )[:, :length]
+    batches = []
+    for start in range(0, count, batch_size):
+        current = min(batch_size, count - start)
+        prompts = torch.full((current, 1), int(bos), dtype=torch.long, device=device)
+        with torch.inference_mode():
+            generated = model.generate(
+                input_ids=prompts,
+                max_new_tokens=max(1, length - 1),
+                do_sample=True,
+                temperature=1.0,
+                top_p=0.95,
+                use_cache=True,
+                pad_token_id=getattr(tokenizer, "pad_token_id", None) or int(bos),
+            )[:, :length]
+        batches.append(generated.cpu())
+        del generated, prompts
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    return torch.cat(batches, dim=0)
 
 
 def main() -> int:
@@ -72,11 +90,20 @@ def main() -> int:
         natural_sequences=args.natural_sequences,
         guided_sequences=args.guided_sequences,
         sequence_length=args.sequence_length,
+        calibration_batch_size=args.calibration_batch_size,
+        generation_batch_size=args.generation_batch_size,
         retention=args.retention,
         device=str(device),
         dtype=args.dtype,
     )
-    input_ids = _natural_sequences(model, tokenizer, args.natural_sequences, args.sequence_length, device)
+    input_ids = _natural_sequences(
+        model,
+        tokenizer,
+        args.natural_sequences,
+        args.sequence_length,
+        device,
+        args.generation_batch_size,
+    )
     result = RoutingAwarePruner(adapter, config).run(input_ids)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     torch.save(result, args.output)

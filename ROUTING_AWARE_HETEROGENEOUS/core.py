@@ -43,7 +43,9 @@ class RoutingAwarePruner:
         natural_mass = torch.zeros((self.adapter.num_layers, self.adapter.num_experts), device=device, dtype=torch.float64)
         visitation = torch.zeros_like(natural_mass)
         pools = CalibrationPools(natural_mass=natural_mass, natural_visitation=visitation)
-        self._collect_into(pools, natural_input_ids.to(device), natural=True)
+        for start in range(0, natural_input_ids.shape[0], self.config.calibration_batch_size):
+            batch = natural_input_ids[start : start + self.config.calibration_batch_size]
+            self._collect_into(pools, batch.to(device), natural=True)
         natural_tokens = int(natural_input_ids.numel())
         pools.natural_mass.div_(natural_tokens)
         pools.natural_visitation.div_(natural_tokens)
@@ -59,7 +61,7 @@ class RoutingAwarePruner:
         return pools
 
     def _collect_into(self, pools: CalibrationPools, input_ids: torch.Tensor, *, natural: bool) -> None:
-        traces = self.adapter.collect(input_ids)
+        traces = self.adapter.collect(input_ids, max_samples_per_expert=self.config.max_samples_per_expert)
         target = pools.natural if natural else pools.guided
         for layer_id, trace in enumerate(traces):
             selected = trace.selected_experts.long()
@@ -79,10 +81,15 @@ class RoutingAwarePruner:
                 positions = torch.nonzero(selected == expert_id, as_tuple=False)
                 if positions.numel() == 0:
                     continue
+                compact = trace.expert_samples.get(expert_id) if trace.expert_samples is not None else None
+                if compact is None and trace.expert_input is not None:
+                    compact = trace.expert_input.index_select(0, positions[:, 0])
+                if compact is None:
+                    raise RuntimeError("adapter trace did not provide expert-conditioned samples")
                 _append_capped(
                     target,
                     (layer_id, expert_id),
-                    trace.expert_input.index_select(0, positions[:, 0]),
+                    compact,
                     self.config.max_samples_per_expert,
                 )
 

@@ -35,7 +35,7 @@ class ToyAdapter(ArchitectureAdapter):
     def device(self) -> torch.device:
         return self._device
 
-    def collect(self, input_ids: torch.Tensor) -> tuple[LayerTrace, ...]:
+    def collect(self, input_ids: torch.Tensor, max_samples_per_expert: int = 128) -> tuple[LayerTrace, ...]:
         """Convert token ids into hidden vectors and run deterministic top-k routing."""
 
         values = input_ids.to(self._device, dtype=torch.float32)
@@ -45,7 +45,12 @@ class ToyAdapter(ArchitectureAdapter):
         for layer_id in range(self.num_layers):
             logits = hidden @ self._gate[layer_id].transpose(0, 1)
             weights, selected = torch.topk(torch.softmax(logits.float(), dim=-1), 1, dim=-1)
-            traces.append(LayerTrace(hidden, selected, weights.to(hidden.dtype)))
+            samples = {
+                expert_id: hidden[(selected[:, 0] == expert_id)][:max_samples_per_expert]
+                for expert_id in range(self.num_experts)
+                if bool((selected[:, 0] == expert_id).any())
+            }
+            traces.append(LayerTrace(hidden, selected, weights.to(hidden.dtype), samples))
             hidden = hidden + 0.01 * (weights * selected.float()).sum(dim=-1, keepdim=True)
         return tuple(traces)
 
