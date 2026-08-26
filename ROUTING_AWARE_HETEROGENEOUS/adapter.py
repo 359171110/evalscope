@@ -127,13 +127,7 @@ class HuggingFaceAdapter(ArchitectureAdapter):
                 raw = args[0]
                 expert_input = self.native_adapter.expert_input(layers[current_layer], raw)
                 indices, weights = self.native_adapter.route_from_captured(layers[current_layer], raw, expert_input)
-                compact_samples = {}
-                for expert_id in range(self.num_experts):
-                    positions = torch.nonzero(indices == expert_id, as_tuple=False)
-                    if positions.numel() > 0:
-                        compact_samples[expert_id] = expert_input.index_select(
-                            0, positions[:max_samples_per_expert, 0]
-                        ).detach()
+                compact_samples = self._compact_expert_samples(indices, expert_input, max_samples_per_expert)
                 self._traces.append(
                     (
                         current_layer,
@@ -162,6 +156,33 @@ class HuggingFaceAdapter(ArchitectureAdapter):
         traces = dict(self._traces)
         return tuple(traces[layer_id] for layer_id in range(self.num_layers))
 
+    def _compact_expert_samples(
+        self,
+        selected_experts: torch.Tensor,
+        expert_input: torch.Tensor,
+        maximum: int,
+    ) -> dict[int, torch.Tensor]:
+        """Group routed token rows with one GPU sort instead of one scan per expert."""
+
+        flat_experts = selected_experts.reshape(-1).long()
+        top_k = int(selected_experts.shape[1])
+        token_ids = torch.arange(
+            selected_experts.shape[0], device=selected_experts.device, dtype=torch.long
+        ).repeat_interleave(top_k)
+        order = torch.argsort(flat_experts, stable=True)
+        sorted_experts = flat_experts.index_select(0, order)
+        sorted_tokens = token_ids.index_select(0, order)
+        unique_experts, counts = torch.unique_consecutive(sorted_experts, return_counts=True)
+        samples: dict[int, torch.Tensor] = {}
+        offset = 0
+        for expert_id_tensor, count_tensor in zip(unique_experts, counts):
+            count = int(count_tensor.item())
+            expert_id = int(expert_id_tensor.item())
+            token_rows = sorted_tokens[offset : offset + min(count, maximum)]
+            samples[expert_id] = expert_input.index_select(0, token_rows).detach()
+            offset += count
+        return samples
+
     def expert_weights(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
         """Return native packed expert weights."""
 
@@ -187,6 +208,7 @@ class HuggingFaceAdapter(ArchitectureAdapter):
             do_sample=True,
             temperature=1.0,
             top_p=0.95,
+            use_cache=True,
             pad_token_id=getattr(self.model.config, "pad_token_id", None),
         )
         return generated[:, :length]

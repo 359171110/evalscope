@@ -15,6 +15,7 @@ class CalibrationPools:
     guided: dict[tuple[int, int], torch.Tensor] = field(default_factory=dict)
     natural_mass: torch.Tensor | None = None
     natural_visitation: torch.Tensor | None = None
+    guided_sequences_used: int = 0
 
     def combined(self, key: tuple[int, int], minimum: int, maximum: int) -> torch.Tensor:
         """Return natural samples, completed with guided samples when needed."""

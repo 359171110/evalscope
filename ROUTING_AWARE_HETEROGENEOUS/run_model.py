@@ -21,6 +21,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--sequence-length", type=int, default=2048)
     parser.add_argument("--calibration-batch-size", type=int, default=1)
     parser.add_argument("--generation-batch-size", type=int, default=1)
+    parser.add_argument("--guided-batch-size", type=int, default=1)
     parser.add_argument("--retention", type=float, default=0.5)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("float16", "bfloat16", "float32"), default="float16")
@@ -92,6 +93,7 @@ def main() -> int:
         sequence_length=args.sequence_length,
         calibration_batch_size=args.calibration_batch_size,
         generation_batch_size=args.generation_batch_size,
+        guided_batch_size=args.guided_batch_size,
         retention=args.retention,
         device=str(device),
         dtype=args.dtype,
