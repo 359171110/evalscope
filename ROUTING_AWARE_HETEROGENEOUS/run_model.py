@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import time
 from pathlib import Path
 
 import torch
@@ -50,12 +51,23 @@ def _natural_sequences(
     if bos is None:
         raise ValueError("tokenizer needs bos_token_id or eos_token_id")
     batches = []
+    total_tokens = 0
+    started_at = time.perf_counter()
+    previous_elapsed = 0.0
     for start in range(0, count, batch_size):
         current = min(batch_size, count - start)
         prompts = torch.full((current, 1), int(bos), dtype=torch.long, device=device)
+        attention_mask = torch.ones_like(prompts)
+        print(
+            f"[natural-generation-start] batch={start // batch_size + 1} "
+            f"sequences={start + 1}-{start + current}/{count} "
+            f"target_length={length} batch_size={current}",
+            flush=True,
+        )
         with torch.inference_mode():
             generated = model.generate(
                 input_ids=prompts,
+                attention_mask=attention_mask,
                 max_new_tokens=max(1, length - 1),
                 do_sample=True,
                 temperature=1.0,
@@ -64,7 +76,21 @@ def _natural_sequences(
                 pad_token_id=getattr(tokenizer, "pad_token_id", None) or int(bos),
             )[:, :length]
         batches.append(generated.cpu())
-        del generated, prompts
+        total_tokens += int(generated.shape[0] * generated.shape[1])
+        elapsed = max(time.perf_counter() - started_at, 1.0e-6)
+        batch_elapsed = elapsed if start == 0 else elapsed - previous_elapsed
+        batch_tokens = int(generated.shape[0] * generated.shape[1])
+        batch_rate = batch_tokens / max(batch_elapsed, 1.0e-6)
+        overall_rate = total_tokens / elapsed
+        print(
+            f"[natural-generation] batch={start // batch_size + 1} "
+            f"sequences={min(start + current, count)}/{count} "
+            f"tokens={total_tokens} batch_tokens_per_sec={batch_rate:.2f} "
+            f"overall_tokens_per_sec={overall_rate:.2f} elapsed_sec={elapsed:.1f}",
+            flush=True,
+        )
+        previous_elapsed = elapsed
+        del attention_mask, generated, prompts
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     return torch.cat(batches, dim=0)
@@ -79,13 +105,28 @@ def main() -> int:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     device = torch.device(args.device)
+    if device.type == "cuda":
+        device_index = torch.cuda.current_device() if device.index is None else device.index
+        properties = torch.cuda.get_device_properties(device_index)
+        print(
+            f"[runtime] torch={torch.__version__} cuda={torch.version.cuda} "
+            f"device={properties.name} capability={properties.major}.{properties.minor} "
+            f"memory_gib={properties.total_memory / 2**30:.1f}",
+            flush=True,
+        )
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model_path,
-        torch_dtype=_dtype(args.dtype),
-        trust_remote_code=True,
-        device_map={"": str(device)},
-    ).eval()
+    load_kwargs = {
+        "torch_dtype": _dtype(args.dtype),
+        "trust_remote_code": True,
+    }
+    if device.type != "cuda" or torch.cuda.device_count() <= 1:
+        model = AutoModelForCausalLM.from_pretrained(args.model_path, **load_kwargs).to(device).eval()
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model_path,
+            device_map={"": str(device)},
+            **load_kwargs,
+        ).eval()
     adapter = adapter_from_model(model)
     config = MethodConfig(
         natural_sequences=args.natural_sequences,

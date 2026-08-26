@@ -202,8 +202,10 @@ class HuggingFaceAdapter(ArchitectureAdapter):
         ).indices
         anchor = candidates[0].reshape(1, 1)
         prompt = anchor.expand(count, 1)
+        attention_mask = torch.ones_like(prompt)
         generated = self.model.generate(
             input_ids=prompt,
+            attention_mask=attention_mask,
             max_new_tokens=max(1, int(length) - 1),
             do_sample=True,
             temperature=1.0,

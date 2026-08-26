@@ -180,6 +180,8 @@ class RoutingAwarePruner:
                 gate, up = gate_up[expert_id].chunk(2, dim=0)
                 activation = channel_activation(samples, gate, up, self._activation_name())
                 width = int(widths[layer_id, expert_id].item())
+                if width == channels:
+                    continue
                 ranking = rankings[layer_id, expert_id]
                 folded, record = ridge_fold_down(
                     activation,
