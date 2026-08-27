@@ -65,6 +65,56 @@ def _token_metrics(tokens: list[int]) -> dict[str, float]:
     }
 
 
+def _aggregate_quality(metrics: list[dict[str, float]]) -> dict[str, float | int]:
+    """Aggregate repetition diagnostics for one inspection granularity."""
+
+    if not metrics:
+        return {"count": 0}
+    return {
+        "count": len(metrics),
+        "mean_distinct_token_ratio": sum(item["distinct_token_ratio"] for item in metrics) / len(metrics),
+        "rows_distinct_below_0_02": sum(item["distinct_token_ratio"] < 0.02 for item in metrics),
+        "rows_dominant_token_above_0_50": sum(item["dominant_token_ratio"] > 0.50 for item in metrics),
+        "rows_max_run_above_0_25": sum(item["max_run_ratio"] > 0.25 for item in metrics),
+        "rows_repeated_4gram_above_0_85": sum(item["repeated_4gram_ratio"] > 0.85 for item in metrics),
+    }
+
+
+def _reconstruct_episodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    """Reconstruct episode and turn token ranges from packed-cache provenance."""
+
+    records = payload.get("token_stream", {}).get("episode_boundaries", [])
+    scaffold = payload.get("generation_health", {}).get("native_scaffold", {})
+    prefix_tokens = int(scaffold.get("user_prefix_tokens", 0))
+    bridge_tokens = int(scaffold.get("user_bridge_tokens", 0))
+    flat = payload["input_ids"].reshape(-1).tolist()
+    grouped: dict[int, list[dict[str, Any]]] = {}
+    for record in records:
+        grouped.setdefault(int(record["episode_id"]), []).append(record)
+    episodes = []
+    for episode_id, segments in sorted(grouped.items()):
+        ordered = sorted(segments, key=lambda item: int(item.get("source_start", 0)))
+        if not ordered or not bool(ordered[-1].get("complete", False)):
+            continue
+        episode_tokens = []
+        for segment in ordered:
+            episode_tokens.extend(flat[int(segment["start"]):int(segment["end"])])
+        metadata = ordered[0]
+        user_length = int(metadata.get("user_tokens", 0))
+        assistant_length = int(metadata.get("assistant_tokens", 0))
+        user_start = prefix_tokens
+        assistant_start = prefix_tokens + user_length + bridge_tokens
+        episodes.append({
+            "episode_id": episode_id,
+            "tokens": episode_tokens,
+            "user_tokens": episode_tokens[user_start:user_start + user_length],
+            "assistant_tokens": episode_tokens[assistant_start:assistant_start + assistant_length],
+            "user_terminated": bool(metadata.get("user_terminated", False)),
+            "assistant_terminated": bool(metadata.get("assistant_terminated", False)),
+        })
+    return episodes
+
+
 def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str, Any]:
     """Inspect one cache and return a JSON-serializable health report."""
 
@@ -74,12 +124,15 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
     tokens = payload["input_ids"].reshape(int(payload["calibration_sequences"]), -1)
     tokenizer = AutoTokenizer.from_pretrained(model_path.expanduser().resolve(), trust_remote_code=True)
     texts = [tokenizer.decode(row.tolist(), skip_special_tokens=True) for row in tokens]
+    episodes = _reconstruct_episodes(payload)
+    user_texts = [tokenizer.decode(item["user_tokens"], skip_special_tokens=True) for item in episodes]
+    assistant_texts = [tokenizer.decode(item["assistant_tokens"], skip_special_tokens=True) for item in episodes]
     language = Counter()
     categories = Counter()
-    metrics = []
+    block_metrics = []
     for row, text in zip(tokens, texts):
         metric = _token_metrics(row.tolist())
-        metrics.append(metric)
+        block_metrics.append(metric)
         scripts = {
             "latin_dominant": len(re.findall(r"[A-Za-z]", text)),
             "cjk_dominant": len(re.findall(r"[\u3400-\u9fff]", text)),
@@ -99,14 +152,15 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
         "language_rows": dict(sorted(language.items())),
         "overlapping_category_rows": dict(sorted(categories.items())),
         "quality": {
-            "mean_distinct_token_ratio": sum(item["distinct_token_ratio"] for item in metrics) / len(metrics),
-            "rows_distinct_below_0_02": sum(item["distinct_token_ratio"] < 0.02 for item in metrics),
-            "rows_dominant_token_above_0_50": sum(item["dominant_token_ratio"] > 0.50 for item in metrics),
-            "rows_max_run_above_0_25": sum(item["max_run_ratio"] > 0.25 for item in metrics),
-            "rows_repeated_4gram_above_0_85": sum(item["repeated_4gram_ratio"] > 0.85 for item in metrics),
+            "block": _aggregate_quality(block_metrics),
+            "episode": _aggregate_quality([_token_metrics(item["tokens"]) for item in episodes]),
+            "user": _aggregate_quality([_token_metrics(item["user_tokens"]) for item in episodes]),
+            "assistant": _aggregate_quality([_token_metrics(item["assistant_tokens"]) for item in episodes]),
         },
         "generation_health": payload.get("generation_health", {}),
         "samples": [" ".join(text.split())[:700] for text in texts[:max(0, sample_count)]],
+        "user_samples": [" ".join(text.split())[:700] for text in user_texts[:max(0, sample_count)]],
+        "assistant_samples": [" ".join(text.split())[:700] for text in assistant_texts[:max(0, sample_count)]],
     }
     return health
 

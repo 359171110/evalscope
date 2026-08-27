@@ -1480,6 +1480,27 @@ $$
 * `inspect_native_calibration.py`：解码校准块，统计语言、主题、重复率和生成健康度，并输出代表性样本。
 * `test_native_calibration.py`：验证重复检测、固定 block 打包和 episode boundary 记录。
 
+## 31.1 Gemma4/Qwen3.6 的 user-turn 修复
+
+旧版虽然使用了 native chat template，但仍然错误地假设：
+
+$$
+P(\text{user content}\mid\text{user role prefix})
+$$
+
+是 checkpoint 的可靠生成分布。对 instruction checkpoint，这个条件通常没有得到充分训练；因此 user turn 可能从一开始就进入跨语言片段循环。旧版还在 `user + assistant + packed block` 上做质量检查，正常结束的 assistant 会把坏 user 的统计冲淡。
+
+当前 `cn_moe_sc_native_dialogue_v2` 的默认行为是：
+
+1. 使用 checkpoint native generation scaffold 做 bootstrap；
+2. 默认从训练得更充分的 assistant generation channel 生成候选语义内容，再把它作为下一轮 user content；
+3. 在 assistant 请求之前单独检查 user turn；
+4. 对 user 使用更严格的 distinct、dominant-token、max-run、重复 4-gram、重复词组和 script-switch gate；
+5. 只有 user 通过后才生成 assistant；
+6. inspector 同时输出 user、assistant、episode 和 block 四种粒度，不能再用 block 指标掩盖坏 episode。
+
+注意：旧版 `cn_moe_sc_native_dialogue_v1` cache 没有 user-turn 级 provenance 和质量保证，不能通过重新运行 inspector 将其升级为 v2 健康 cache；必须重新生成。
+
 默认协议参数为：
 
 $$

@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,7 @@ from src.calibration_data import build_model_cache_identity
 
 
 SENTINEL = "__CN_MOE_SC_USER_SENTINEL_7F3A__"
-PROTOCOL_VERSION = "cn_moe_sc_native_dialogue_v1"
+PROTOCOL_VERSION = "cn_moe_sc_native_dialogue_v2"
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,8 @@ class Episode:
     user_terminated: bool
     assistant_terminated: bool
     seed: int
+    user_token_ids: tuple[int, ...] = ()
+    assistant_token_ids: tuple[int, ...] = ()
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-attempts", type=int, default=512)
     parser.add_argument("--max-user-tokens", type=int, default=512)
     parser.add_argument("--max-assistant-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--user-generation-mode",
+        choices=("assistant_bootstrap", "user_role_continuation"),
+        default="assistant_bootstrap",
+        help="Generate semantic content from the trained assistant role by default.",
+    )
     parser.add_argument("--max-pilot-rejection-rate", type=float, default=0.20)
     parser.add_argument("--warmup-temperature", type=float, default=1.5)
     parser.add_argument("--warmup-tokens", type=int, default=8)
@@ -234,18 +243,118 @@ def _repeat_metrics(token_ids: Iterable[int]) -> dict[str, float]:
     }
 
 
-def _is_valid_episode(episode: Episode) -> tuple[bool, dict[str, float]]:
-    """Reject only obvious mechanical generation failures."""
+def _is_valid_episode(episode: Episode, tokenizer: Any | None = None) -> tuple[bool, dict[str, Any]]:
+    """Require both turns to pass role-specific mechanical validity gates."""
 
-    metrics = _repeat_metrics(episode.token_ids)
-    valid = (
-        len(episode.token_ids) >= 16
-        and metrics["distinct_token_ratio"] >= 0.02
-        and metrics["dominant_token_ratio"] <= 0.50
-        and metrics["max_run_ratio"] <= 0.25
-        and metrics["repeated_4gram_ratio"] <= 0.85
-        and metrics["periodic_loop_ratio"] <= 0.50
-    )
+    user_tokens = list(episode.user_token_ids)
+    assistant_tokens = list(episode.assistant_token_ids)
+    if not user_tokens and not assistant_tokens:
+        # Unit-test/backward-compatible fallback for manually constructed episodes.
+        user_tokens = episode.token_ids[:episode.user_tokens]
+        assistant_tokens = episode.token_ids[-episode.assistant_tokens:] if episode.assistant_tokens else []
+    user_valid, user_metrics = _is_valid_turn(user_tokens, role="user", tokenizer=tokenizer)
+    assistant_valid, assistant_metrics = _is_valid_turn(assistant_tokens, role="assistant", tokenizer=tokenizer)
+    episode_metrics = _repeat_metrics(episode.token_ids)
+    metrics = {
+        "user": user_metrics,
+        "assistant": assistant_metrics,
+        "episode": episode_metrics,
+    }
+    valid = user_valid and assistant_valid
+    return valid, metrics
+
+
+def _text_metrics(text: str) -> dict[str, float]:
+    """Detect repeated lexical fragments and excessive cross-script switching."""
+
+    compact = re.sub(r"\s+", " ", text).strip()
+    words = re.findall(r"\w+", compact.casefold(), flags=re.UNICODE)
+    repeated_word_positions: set[int] = set()
+    for size in (1, 2, 3):
+        seen: set[tuple[str, ...]] = set()
+        for index in range(max(0, len(words) - size + 1)):
+            phrase = tuple(words[index:index + size])
+            if phrase in seen:
+                repeated_word_positions.update(range(index, index + size))
+            seen.add(phrase)
+
+    script_sequence = []
+    for char in compact:
+        if "a" <= char.casefold() <= "z":
+            script = "latin"
+        elif "\u3400" <= char <= "\u9fff":
+            script = "cjk"
+        elif "\u0400" <= char <= "\u04ff":
+            script = "cyrillic"
+        elif "\u0600" <= char <= "\u06ff":
+            script = "arabic"
+        elif "\u1200" <= char <= "\u137f":
+            script = "ethiopic"
+        elif "\u0900" <= char <= "\u097f":
+            script = "devanagari"
+        elif "\u0e00" <= char <= "\u0e7f":
+            script = "thai"
+        elif char.isalpha():
+            script = "other"
+        else:
+            continue
+        script_sequence.append(script)
+    switches = sum(first != second for first, second in zip(script_sequence, script_sequence[1:]))
+    script_counts: dict[str, int] = {}
+    for script in script_sequence:
+        script_counts[script] = script_counts.get(script, 0) + 1
+    minority_share = 0.0
+    if script_sequence:
+        minority_share = 1.0 - max(script_counts.values()) / len(script_sequence)
+
+    return {
+        "repeated_word_ratio": len(repeated_word_positions) / max(len(words), 1),
+        "script_switch_ratio": switches / max(len(script_sequence) - 1, 1),
+        "minority_script_share": minority_share,
+        "characters": float(len(compact)),
+        "words": float(len(words)),
+    }
+
+
+def _is_valid_turn(
+    token_ids: Iterable[int],
+    *,
+    role: str,
+    tokenizer: Any | None = None,
+) -> tuple[bool, dict[str, Any]]:
+    """Apply a strict pre-response gate to user content and a general gate to assistant content."""
+
+    tokens = list(token_ids)
+    metrics = _repeat_metrics(tokens)
+    text = "" if tokenizer is None else tokenizer.decode(tokens, skip_special_tokens=True)
+    text_metrics = _text_metrics(text) if tokenizer is not None else {
+        "repeated_word_ratio": 0.0,
+        "script_switch_ratio": 0.0,
+        "minority_script_share": 0.0,
+        "characters": 0.0,
+        "words": 0.0,
+    }
+    metrics = {**metrics, **text_metrics}
+    if role == "user":
+        valid = (
+            len(tokens) >= 16
+            and metrics["distinct_token_ratio"] >= 0.08
+            and metrics["dominant_token_ratio"] <= 0.25
+            and metrics["max_run_ratio"] <= 0.15
+            and metrics["repeated_4gram_ratio"] <= 0.60
+            and metrics["periodic_loop_ratio"] <= 0.25
+            and metrics["repeated_word_ratio"] <= 0.55
+            and metrics["script_switch_ratio"] <= 0.35
+        )
+    else:
+        valid = (
+            len(tokens) >= 16
+            and metrics["distinct_token_ratio"] >= 0.02
+            and metrics["dominant_token_ratio"] <= 0.50
+            and metrics["max_run_ratio"] <= 0.25
+            and metrics["repeated_4gram_ratio"] <= 0.85
+            and metrics["periodic_loop_ratio"] <= 0.50
+        )
     return valid, metrics
 
 
@@ -327,6 +436,9 @@ def _build_episodes(
     batch_size: int,
     max_user_tokens: int,
     max_assistant_tokens: int,
+    user_generation_mode: str = "assistant_bootstrap",
+    special_token_ids: set[int] | None = None,
+    tokenizer: Any | None = None,
     warmup_temperature: float = 1.0,
     warmup_tokens: int = 0,
 ) -> list[Episode]:
@@ -336,38 +448,55 @@ def _build_episodes(
     for begin in range(0, count, batch_size):
         current = min(batch_size, count - begin)
         seeds = [seed_start + begin + offset for offset in range(current)]
-        user_prompts = [scaffold.user_prefix for _ in range(current)]
+        if user_generation_mode == "assistant_bootstrap":
+            user_prompts = [scaffold.user_prefix + scaffold.user_bridge for _ in range(current)]
+            user_stop_token_id = scaffold.assistant_stop_token_id
+        else:
+            user_prompts = [scaffold.user_prefix for _ in range(current)]
+            user_stop_token_id = scaffold.user_stop_token_id
         user_outputs = _generate_batch(
             llm,
             sampling_params_type,
             user_prompts,
             max_tokens=max_user_tokens,
-            stop_token_id=scaffold.user_stop_token_id,
+            stop_token_id=user_stop_token_id,
             seeds=seeds,
             warmup_temperature=warmup_temperature,
             warmup_tokens=warmup_tokens,
         )
         user_parts = [
-            _without_stop(tokens, scaffold.user_stop_token_id, naturally_terminated)
+            _without_stop(tokens, user_stop_token_id, naturally_terminated)
             for tokens, naturally_terminated in user_outputs
         ]
-        assistant_prompts = [
-            scaffold.user_prefix + user_tokens + scaffold.user_bridge
-            for user_tokens, _ in user_parts
+        if user_generation_mode == "assistant_bootstrap" and special_token_ids:
+            user_parts = [
+                ([token_id for token_id in tokens if token_id not in special_token_ids], terminated)
+                for tokens, terminated in user_parts
+            ]
+        valid_user_indexes = [
+            index for index, (tokens, _) in enumerate(user_parts)
+            if _is_valid_turn(tokens, role="user", tokenizer=tokenizer)[0]
         ]
-        assistant_outputs = _generate_batch(
-            llm,
-            sampling_params_type,
-            assistant_prompts,
-            max_tokens=max_assistant_tokens,
-            stop_token_id=scaffold.assistant_stop_token_id,
-            seeds=[seed + 1_000_000 for seed in seeds],
-            warmup_temperature=warmup_temperature,
-            warmup_tokens=warmup_tokens,
-        )
-        for index, (user_part, assistant_output) in enumerate(zip(user_parts, assistant_outputs)):
+        assistant_outputs_by_index: dict[int, tuple[list[int], bool]] = {}
+        if valid_user_indexes:
+            assistant_prompts = [
+                scaffold.user_prefix + user_parts[index][0] + scaffold.user_bridge
+                for index in valid_user_indexes
+            ]
+            assistant_outputs = _generate_batch(
+                llm,
+                sampling_params_type,
+                assistant_prompts,
+                max_tokens=max_assistant_tokens,
+                stop_token_id=scaffold.assistant_stop_token_id,
+                seeds=[seeds[index] + 1_000_000 for index in valid_user_indexes],
+                warmup_temperature=warmup_temperature,
+                warmup_tokens=warmup_tokens,
+            )
+            assistant_outputs_by_index = dict(zip(valid_user_indexes, assistant_outputs))
+        for index, user_part in enumerate(user_parts):
             user_tokens, user_terminated = user_part
-            assistant_output_tokens, assistant_stopped = assistant_output
+            assistant_output_tokens, assistant_stopped = assistant_outputs_by_index.get(index, ([], False))
             assistant_tokens, assistant_terminated = _without_stop(
                 assistant_output_tokens,
                 scaffold.assistant_stop_token_id,
@@ -380,16 +509,17 @@ def _build_episodes(
                 + assistant_tokens
                 + scaffold.assistant_suffix
             )
-            episodes.append(
-                Episode(
-                    token_ids=token_ids,
-                    user_tokens=len(user_tokens),
-                    assistant_tokens=len(assistant_tokens),
-                    user_terminated=user_terminated,
-                    assistant_terminated=assistant_terminated,
-                    seed=seeds[index],
-                )
+            episode = Episode(
+                token_ids=token_ids,
+                user_tokens=len(user_tokens),
+                assistant_tokens=len(assistant_tokens),
+                user_terminated=user_terminated,
+                assistant_terminated=assistant_terminated,
+                seed=seeds[index],
+                user_token_ids=tuple(user_tokens),
+                assistant_token_ids=tuple(assistant_tokens),
             )
+            episodes.append(episode)
     return episodes
 
 
@@ -425,6 +555,8 @@ def _pack_blocks(
                 "user_terminated": episode.user_terminated,
                 "assistant_terminated": episode.assistant_terminated,
                 "seed": episode.seed,
+                "source_start": source_offset,
+                "source_end": source_offset + take,
             })
             remaining -= take
             source_offset += take
@@ -467,6 +599,7 @@ def _build_payload(
     warmup_enabled: bool,
     warmup_temperature: float,
     warmup_tokens: int,
+    user_generation_mode: str,
 ) -> dict[str, Any]:
     """Create an auditable shared calibration payload."""
 
@@ -482,6 +615,7 @@ def _build_payload(
             "sampling": "independent_per_sequence",
             "episode_sampling": "independent_native_self_dialogue",
             "prompt": "checkpoint_native_chat_template",
+            "user_generation_mode": user_generation_mode,
             "temperature": 1.0,
             "top_p": 1.0,
             "top_k": 0,
@@ -571,6 +705,7 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
     model_path = args.model_path.expanduser().resolve()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     scaffold = build_native_scaffold(tokenizer)
+    special_token_ids = {int(token_id) for token_id in tokenizer.all_special_ids}
     print(
         f"native_scaffold user_prefix={len(scaffold.user_prefix)} "
         f"user_bridge={len(scaffold.user_bridge)} assistant_suffix={len(scaffold.assistant_suffix)}",
@@ -599,8 +734,11 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
         batch_size=args.episode_batch_size,
         max_user_tokens=args.max_user_tokens,
         max_assistant_tokens=args.max_assistant_tokens,
+        user_generation_mode=args.user_generation_mode,
+        special_token_ids=special_token_ids,
+        tokenizer=tokenizer,
     )
-    pilot_valid = [_is_valid_episode(episode)[0] for episode in pilot]
+    pilot_valid = [_is_valid_episode(episode, tokenizer)[0] for episode in pilot]
     pilot_rejection_rate = sum(not valid for valid in pilot_valid) / max(len(pilot_valid), 1)
     print(
         f"pilot accepted={sum(pilot_valid)}/{len(pilot_valid)} "
@@ -620,10 +758,13 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
             batch_size=args.episode_batch_size,
             max_user_tokens=args.max_user_tokens,
             max_assistant_tokens=args.max_assistant_tokens,
+            user_generation_mode=args.user_generation_mode,
+            special_token_ids=special_token_ids,
+            tokenizer=tokenizer,
             warmup_temperature=args.warmup_temperature,
             warmup_tokens=args.warmup_tokens,
         )
-        warmup_valid = [_is_valid_episode(episode)[0] for episode in warmup_pilot]
+        warmup_valid = [_is_valid_episode(episode, tokenizer)[0] for episode in warmup_pilot]
         warmup_rejection_rate = sum(not valid for valid in warmup_valid) / max(len(warmup_valid), 1)
         print(
             f"warmup_pilot accepted={sum(warmup_valid)}/{len(warmup_valid)} "
@@ -653,13 +794,16 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
             batch_size=request_count,
             max_user_tokens=args.max_user_tokens,
             max_assistant_tokens=args.max_assistant_tokens,
+            user_generation_mode=args.user_generation_mode,
+            special_token_ids=special_token_ids,
+            tokenizer=tokenizer,
             warmup_temperature=args.warmup_temperature if warmup_enabled else 1.0,
             warmup_tokens=args.warmup_tokens if warmup_enabled else 0,
         )
         seed_cursor += request_count
         attempted += request_count
         for episode in generated:
-            valid, metrics = _is_valid_episode(episode)
+            valid, metrics = _is_valid_episode(episode, tokenizer)
             if valid:
                 accepted.append(episode)
                 accepted_tokens += len(episode.token_ids)
@@ -698,6 +842,7 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
         warmup_enabled=warmup_enabled,
         warmup_temperature=args.warmup_temperature,
         warmup_tokens=args.warmup_tokens,
+        user_generation_mode=args.user_generation_mode,
     )
     payload["calibration_pools"] = {
         "natural_discovery": {

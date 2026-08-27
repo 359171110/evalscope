@@ -35,20 +35,57 @@ def test_repeat_metrics_detect_short_period_loop() -> None:
     )
     valid, metrics = MODULE._is_valid_episode(episode)
     assert not valid
-    assert metrics["periodic_loop_ratio"] == 1.0
+    assert metrics["user"]["periodic_loop_ratio"] == 1.0
 
 
 def test_validity_gate_accepts_varied_episode() -> None:
     episode = MODULE.Episode(
-        token_ids=list(range(32)),
-        user_tokens=8,
-        assistant_tokens=8,
+        token_ids=list(range(64)),
+        user_tokens=24,
+        assistant_tokens=24,
         user_terminated=True,
         assistant_terminated=True,
         seed=42,
+        user_token_ids=tuple(range(24)),
+        assistant_token_ids=tuple(range(24, 48)),
     )
     valid, _ = MODULE._is_valid_episode(episode)
     assert valid
+
+
+def test_text_metrics_detect_repeated_fragments() -> None:
+    metrics = MODULE._text_metrics("implementation-implementation " * 20)
+    assert metrics["repeated_word_ratio"] > 0.9
+
+    metrics = MODULE._text_metrics("ትን-ትን-ትን " * 20)
+    assert metrics["repeated_word_ratio"] > 0.9
+
+    metrics = MODULE._text_metrics("de-spa-el de-spa-el " * 20)
+    assert metrics["repeated_word_ratio"] > 0.9
+
+
+def test_user_gate_rejects_token_level_phrase_loop() -> None:
+    tokens = [1, 2, 3, 4, 5, 6] * 20
+    valid, metrics = MODULE._is_valid_turn(tokens, role="user")
+    assert not valid
+    assert metrics["repeated_4gram_ratio"] > 0.6
+
+
+def test_bad_user_is_rejected_before_response_quality_can_dilute_it() -> None:
+    episode = MODULE.Episode(
+        token_ids=list(range(24)) + [99] * 80,
+        user_tokens=24,
+        assistant_tokens=80,
+        user_terminated=True,
+        assistant_terminated=True,
+        seed=42,
+        user_token_ids=tuple([1, 2, 3, 4] * 6),
+        assistant_token_ids=tuple(range(80)),
+    )
+    valid, metrics = MODULE._is_valid_episode(episode)
+    assert not valid
+    assert metrics["user"]["repeated_4gram_ratio"] > 0.6
+    assert metrics["assistant"]["dominant_token_ratio"] < 0.1
 
 
 def test_packing_preserves_fixed_blocks_and_episode_boundaries() -> None:
