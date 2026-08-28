@@ -1501,6 +1501,61 @@ $$
 
 澄清、拒答、列表、固定格式回答等语义模式本身属于 checkpoint 的自生成特征，不应因为“信息量低”而被删除。只有机械性的 token/短 n-gram/周期循环才进入 hard rejection。对 clarification mode 的正确处理是记录其比例、长度和跨 episode 的模式集中度；`inspect_native_calibration.py` 在有 episode boundary 时会按 assistant turn 输出 `semantic_modes.clarification_rows`、`clarification_rate`、不同澄清模板数和 top 模板，否则退化为 block-level 统计。如果它占比过高，应作为 generation-mode concentration 报告，不能冒充 broad-topic calibration，也不应在未定义采样混合策略的情况下擅自删除。
 
+## 31.2 v1/v2 的定义：模型原生行为的最低限度工程适配
+
+这里的 v1/v2 不表示两种预先规定的语义数据分布，也不表示对文本质量进行优化。它们表示：针对不同 checkpoint 的训练格式、native control tokens 和 instruction-following 行为，为了让模型产生**稳定、可观测、可用于 MoE 统计的 token 流**，所选择的两种最低限度工程入口。
+
+### v1：user-role continuation
+
+v1 从 checkpoint 的原生 user-role prefix 继续生成：
+
+$$
+P_\theta(x\mid\text{native user-role prefix}).
+$$
+
+如果模型在该入口下能够稳定地产生用户问题、代码、文档或其他自然 continuation，就不再引入额外内容控制，直接保留这些 token。Qwen3 和 Qwen3.6 当前观察到的稳定 user continuation 属于这种情况。
+
+### v2：assistant-channel bootstrap
+
+如果模型在 user-role prefix 后容易进入碎片或跨语言机械循环，则使用 checkpoint 原生 assistant generation channel 作为稳定入口：
+
+$$
+P_\theta(x\mid\text{native assistant-generation scaffold}),
+$$
+
+再将生成内容包装进 native user turn，继续完成 self-dialogue。这里的目标不是把 assistant 文本伪装成更高质量的 user 文本，而是利用该 checkpoint 已经训练得更稳定的 generation channel，避免生成系统本身先失效。Gemma4 当前观察到 v2 比 v1 稳定，属于这种工程适配。
+
+### 最小干预原则
+
+两种入口都必须满足：
+
+1. 只使用 checkpoint 自己的 tokenizer、chat template、role token、turn token 和 channel token；
+2. 不注入人工主题、关键词或外部语料；
+3. 不删除 clarification、refusal、list、boilerplate 或多语言等语义模式；
+4. 只拒绝明确的机械生成故障，例如极端 token/短 n-gram/周期循环；
+5. 记录实际使用的 generation mode、seed、终止状态、拒绝率和 mode concentration；
+6. 后续报告中明确不同模型使用的入口，不能把 v1/v2 的统计结果不加说明地当作完全相同的输入分布。
+
+因此，v1/v2 的选择依据是：
+
+$$
+	ext{checkpoint-native stability}
+\quad\text{而不是}\quad
+	ext{semantic preference or benchmark tuning}.
+$$
+
+它们对模型分布的影响应尽可能小，但不可能声称完全没有影响。正确做法是把入口选择作为 calibration provenance，并通过 expert hit frequency、router mass、conditional channel activation 以及 split-half stability 检查这种工程适配是否改变了后续 pruning 结论。
+
+当前推荐是：
+
+| 模型 | 推荐 generation mode | 选择理由 |
+|---|---|---|
+| Qwen3 | `user_role_continuation`（v1） | user-role continuation 稳定，能产生较丰富的自然内容 |
+| Qwen3.6 | `user_role_continuation`（v1） | v1 的输入状态更稳定，避免 assistant bootstrap 的澄清集中 |
+| Gemma4 | `assistant_bootstrap`（v2） | assistant generation channel 比 user-role continuation 更稳定 |
+
+这三个模型可以使用不同 generation mode，但必须使用相同的记录、统计和机械健康检查标准。换句话说，统一的是**校准目标和审计规则**，不是强行统一每个 checkpoint 的生成入口。
+
 注意：旧版 `cn_moe_sc_native_dialogue_v1` cache 没有 user-turn 级 provenance 和质量保证，不能通过重新运行 inspector 将其升级为 v2 健康 cache；必须重新生成。
 
 默认协议参数为：
