@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -uo pipefail
+set -euo pipefail
 
 ROOT=/data01/home/xinpei.gao/evalscope
 PY=/data01/home/xinpei.gao/.conda/envs/gemma4-vllm-cu128/bin/python
