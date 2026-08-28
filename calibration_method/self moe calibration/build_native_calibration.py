@@ -343,8 +343,6 @@ def _is_valid_turn(
             and metrics["max_run_ratio"] <= 0.15
             and metrics["repeated_4gram_ratio"] <= 0.60
             and metrics["periodic_loop_ratio"] <= 0.25
-            and metrics["repeated_word_ratio"] <= 0.55
-            and metrics["script_switch_ratio"] <= 0.35
         )
     else:
         valid = (

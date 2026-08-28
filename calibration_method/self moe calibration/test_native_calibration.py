@@ -71,6 +71,17 @@ def test_user_gate_rejects_token_level_phrase_loop() -> None:
     assert metrics["repeated_4gram_ratio"] > 0.6
 
 
+def test_semantic_clarification_is_not_hard_filtered() -> None:
+    class FakeTokenizer:
+        def decode(self, tokens, skip_special_tokens=True):
+            return "It seems like your message might be incomplete. Could you please clarify?"
+
+    tokens = list(range(32))
+    valid, metrics = MODULE._is_valid_turn(tokens, role="user", tokenizer=FakeTokenizer())
+    assert valid
+    assert metrics["repeated_word_ratio"] == 0.0
+
+
 def test_bad_user_is_rejected_before_response_quality_can_dilute_it() -> None:
     episode = MODULE.Episode(
         token_ids=list(range(24)) + [99] * 80,

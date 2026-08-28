@@ -24,6 +24,12 @@ PATTERNS = {
     "web_or_structured": r"https?://|www\.|\{\s*[\"']|<html|<div|\[\s*\{",
 }
 
+CLARIFICATION_PATTERN = re.compile(
+    r"\b(please clarify|could you clarify|message .* incomplete|provide more "
+    r"(?:details|information)|not sure what you mean|what would you like)\b",
+    re.IGNORECASE,
+)
+
 
 def parse_args() -> argparse.Namespace:
     """Parse inspection arguments."""
@@ -130,6 +136,7 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
     language = Counter()
     categories = Counter()
     block_metrics = []
+    clarification_texts: list[str] = []
     for row, text in zip(tokens, texts):
         metric = _token_metrics(row.tolist())
         block_metrics.append(metric)
@@ -143,6 +150,11 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
         for category, pattern in PATTERNS.items():
             if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
                 categories[category] += 1
+    semantic_texts = assistant_texts if assistant_texts else texts
+    for text in semantic_texts:
+        if CLARIFICATION_PATTERN.search(text):
+            clarification_texts.append(" ".join(text.split()).lower())
+    clarification_counts = Counter(clarification_texts)
     health = {
         "cache": str(cache.expanduser().resolve()),
         "protocol_name": payload.get("protocol_name"),
@@ -151,6 +163,12 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
         "block_length": int(payload["sequence_length"]),
         "language_rows": dict(sorted(language.items())),
         "overlapping_category_rows": dict(sorted(categories.items())),
+        "semantic_modes": {
+            "clarification_rows": len(clarification_texts),
+            "clarification_rate": len(clarification_texts) / max(len(texts), 1),
+            "distinct_clarification_forms": len(clarification_counts),
+            "top_clarification_forms": clarification_counts.most_common(10),
+        },
         "quality": {
             "block": _aggregate_quality(block_metrics),
             "episode": _aggregate_quality([_token_metrics(item["tokens"]) for item in episodes]),

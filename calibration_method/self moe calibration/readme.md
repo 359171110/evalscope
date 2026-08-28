@@ -1495,9 +1495,11 @@ $$
 1. 使用 checkpoint native generation scaffold 做 bootstrap；
 2. 默认从训练得更充分的 assistant generation channel 生成候选语义内容，再把它作为下一轮 user content；
 3. 在 assistant 请求之前单独检查 user turn；
-4. 对 user 使用更严格的 distinct、dominant-token、max-run、重复 4-gram、重复词组和 script-switch gate；
+4. 对 user 使用更严格的 distinct、dominant-token、max-run、重复 4-gram 和周期循环 gate；重复词组与 script-switch 只作为诊断指标，不作为硬拒绝条件；
 5. 只有 user 通过后才生成 assistant；
 6. inspector 同时输出 user、assistant、episode 和 block 四种粒度，不能再用 block 指标掩盖坏 episode。
+
+澄清、拒答、列表、固定格式回答等语义模式本身属于 checkpoint 的自生成特征，不应因为“信息量低”而被删除。只有机械性的 token/短 n-gram/周期循环才进入 hard rejection。对 clarification mode 的正确处理是记录其比例、长度和跨 episode 的模式集中度；`inspect_native_calibration.py` 在有 episode boundary 时会按 assistant turn 输出 `semantic_modes.clarification_rows`、`clarification_rate`、不同澄清模板数和 top 模板，否则退化为 block-level 统计。如果它占比过高，应作为 generation-mode concentration 报告，不能冒充 broad-topic calibration，也不应在未定义采样混合策略的情况下擅自删除。
 
 注意：旧版 `cn_moe_sc_native_dialogue_v1` cache 没有 user-turn 级 provenance 和质量保证，不能通过重新运行 inspector 将其升级为 v2 健康 cache；必须重新生成。
 
