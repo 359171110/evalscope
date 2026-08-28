@@ -57,6 +57,77 @@ def test_text_metrics_detect_repeated_fragments() -> None:
     metrics = MODULE._text_metrics("implementation-implementation " * 20)
     assert metrics["repeated_word_ratio"] > 0.9
 
+
+def test_semantic_modes_are_diagnostic_only() -> None:
+    inspect_path = Path(__file__).with_name("inspect_native_calibration.py")
+    inspect_spec = importlib.util.spec_from_file_location("inspect_native_calibration", inspect_path)
+    assert inspect_spec is not None and inspect_spec.loader is not None
+    inspect_module = importlib.util.module_from_spec(inspect_spec)
+    sys.modules[inspect_spec.name] = inspect_module
+    inspect_spec.loader.exec_module(inspect_module)
+    report = inspect_module._semantic_modes([
+        "It seems like your message might be incomplete. Please clarify.",
+        "I cannot provide that answer.",
+        "1. First\n2. Second",
+    ])
+    assert report["clarification_rate"] == 1 / 3
+    assert report["refusal_rate"] == 1 / 3
+    assert report["mode_rows"]["instructions_or_lists"] == 1
+    assert report["count"] == 3
+
+
+def test_inspector_reconstructs_episode_turns_from_packed_boundaries() -> None:
+    inspect_path = Path(__file__).with_name("inspect_native_calibration.py")
+    inspect_spec = importlib.util.spec_from_file_location("inspect_native_calibration_boundaries", inspect_path)
+    assert inspect_spec is not None and inspect_spec.loader is not None
+    inspect_module = importlib.util.module_from_spec(inspect_spec)
+    sys.modules[inspect_spec.name] = inspect_module
+    inspect_spec.loader.exec_module(inspect_module)
+    payload = {
+        "input_ids": __import__("torch").tensor([[10, 11, 12, 13, 14, 15, 16, 17]]),
+        "generation_health": {
+            "native_scaffold": {
+                "user_prefix_tokens": 1,
+                "user_bridge_tokens": 1,
+            }
+        },
+        "token_stream": {
+            "episode_boundaries": [
+                {
+                    "episode_id": 0,
+                    "block_id": 0,
+                    "start": 0,
+                    "end": 5,
+                    "source_start": 0,
+                    "source_end": 5,
+                    "complete": True,
+                    "user_tokens": 2,
+                    "assistant_tokens": 1,
+                    "user_terminated": True,
+                    "assistant_terminated": True,
+                },
+                {
+                    "episode_id": 1,
+                    "block_id": 0,
+                    "start": 5,
+                    "end": 8,
+                    "source_start": 0,
+                    "source_end": 3,
+                    "complete": True,
+                    "user_tokens": 1,
+                    "assistant_tokens": 0,
+                    "user_terminated": True,
+                    "assistant_terminated": False,
+                },
+            ]
+        },
+    }
+    episodes = inspect_module._reconstruct_episodes(payload)
+    assert len(episodes) == 2
+    assert episodes[0]["user_tokens"] == [11, 12]
+    assert episodes[0]["assistant_tokens"] == [14]
+    assert episodes[1]["user_tokens"] == [16]
+
     metrics = MODULE._text_metrics("ትን-ትን-ትን " * 20)
     assert metrics["repeated_word_ratio"] > 0.9
 

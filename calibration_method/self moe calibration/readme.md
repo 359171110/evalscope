@@ -1476,7 +1476,7 @@ $$
 
 本目录现在包含可执行的参考实现：
 
-* `build_native_calibration.py`：使用 checkpoint 自带 chat template 构造 user/assistant native scaffold，分别独立生成 user turn 和 assistant turn，允许自然终止，仅拒绝机械重复，并将有效 episode 打包为固定长度 calibration blocks。
+* `build_native_calibration.py`：使用 checkpoint 自带 chat template 构造 user/assistant native scaffold，分别独立生成 user turn 和 assistant turn，允许自然终止，仅拒绝明确的机械生成故障，并将有效 episode 打包为固定长度 calibration blocks。
 * `inspect_native_calibration.py`：解码校准块，统计语言、主题、重复率和生成健康度，并输出代表性样本。
 * `test_native_calibration.py`：验证重复检测、固定 block 打包和 episode boundary 记录。
 
@@ -1490,16 +1490,18 @@ $$
 
 是 checkpoint 的可靠生成分布。对 instruction checkpoint，这个条件通常没有得到充分训练；因此 user turn 可能从一开始就进入跨语言片段循环。旧版还在 `user + assistant + packed block` 上做质量检查，正常结束的 assistant 会把坏 user 的统计冲淡。
 
-当前 `cn_moe_sc_native_dialogue_v2` 的默认行为是：
+当前 `cn_moe_sc_native_dialogue_v2_minimal_intervention` 的默认行为是：
 
 1. 使用 checkpoint native generation scaffold 做 bootstrap；
 2. 默认从训练得更充分的 assistant generation channel 生成候选语义内容，再把它作为下一轮 user content；
 3. 在 assistant 请求之前单独检查 user turn；
-4. 对 user 使用更严格的 distinct、dominant-token、max-run、重复 4-gram 和周期循环 gate；重复词组与 script-switch 只作为诊断指标，不作为硬拒绝条件；
+4. 对 user 和 assistant 使用相同的最低限度 mechanical gate：只拒绝空输出、控制 token-only 输出和明显的 token/短 n-gram/周期循环；重复词组、script-switch、语言、列表、澄清和固定格式只作为诊断指标，不作为硬拒绝条件；
 5. 只有 user 通过后才生成 assistant；
 6. inspector 同时输出 user、assistant、episode 和 block 四种粒度，不能再用 block 指标掩盖坏 episode。
 
 澄清、拒答、列表、固定格式回答等语义模式本身属于 checkpoint 的自生成特征，不应因为“信息量低”而被删除。只有机械性的 token/短 n-gram/周期循环才进入 hard rejection。对 clarification mode 的正确处理是记录其比例、长度和跨 episode 的模式集中度；`inspect_native_calibration.py` 在有 episode boundary 时会按 assistant turn 输出 `semantic_modes.clarification_rows`、`clarification_rate`、不同澄清模板数和 top 模板，否则退化为 block-level 统计。如果它占比过高，应作为 generation-mode concentration 报告，不能冒充 broad-topic calibration，也不应在未定义采样混合策略的情况下擅自删除。
+
+三模型 pilot 脚本不再强行统一生成入口：Qwen3/Qwen3.6 使用 v1 的 `user_role_continuation`，Gemma4 使用 v2 的 `assistant_bootstrap`；三者共享同一套最低限度 mechanical gate 和诊断规则。
 
 ## 31.2 v1/v2 的定义：模型原生行为的最低限度工程适配
 

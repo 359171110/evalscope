@@ -26,8 +26,21 @@ PATTERNS = {
 
 CLARIFICATION_PATTERN = re.compile(
     r"\b(please clarify|could you clarify|message .* incomplete|provide more "
-    r"(?:details|information)|not sure what you mean|what would you like)\b",
+    r"(?:details|information)|not sure what you mean|what would you like|"
+    r"please provide more context|could you provide more details)\b|"
+    r"请补充|请澄清|信息不完整|无法确定您指的是|请提供更多",
     re.IGNORECASE,
+)
+REFUSAL_PATTERN = re.compile(
+    r"\b(i can(?:not|'t)|i am unable|i'm unable|cannot|can't|unable to|"
+    r"not able to|i won't|i will not)\b.{0,80}\b(help|assist|provide|answer|do)\b|"
+    r"我无法|不能协助|无法提供|不能帮助",
+    re.IGNORECASE | re.DOTALL,
+)
+FIXED_FORMAT_PATTERN = re.compile(
+    r"(^|\n)\s*(#{1,6}\s+|(?:answer|solution|explanation|summary|output|result)\s*:)|"
+    r"(^|\n)\s*```[\w+-]*\s*$|(^|\n)\s*\|[^\n]+\|\s*$",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -86,6 +99,34 @@ def _aggregate_quality(metrics: list[dict[str, float]]) -> dict[str, float | int
     }
 
 
+def _semantic_modes(texts: list[str]) -> dict[str, Any]:
+    """Summarize semantic modes without treating any mode as invalid."""
+
+    counts = Counter()
+    forms = Counter()
+    for text in texts:
+        compact = " ".join(text.split())
+        for category, pattern in PATTERNS.items():
+            if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+                counts[category] += 1
+        if CLARIFICATION_PATTERN.search(text):
+            counts["clarification"] += 1
+            forms[compact.casefold()] += 1
+        if REFUSAL_PATTERN.search(text):
+            counts["refusal"] += 1
+        if FIXED_FORMAT_PATTERN.search(text):
+            counts["fixed_format"] += 1
+    return {
+        "count": len(texts),
+        "mode_rows": dict(sorted(counts.items())),
+        "clarification_rate": counts["clarification"] / max(len(texts), 1),
+        "refusal_rate": counts["refusal"] / max(len(texts), 1),
+        "fixed_format_rate": counts["fixed_format"] / max(len(texts), 1),
+        "distinct_clarification_forms": len(forms),
+        "top_clarification_forms": forms.most_common(10),
+    }
+
+
 def _reconstruct_episodes(payload: dict[str, Any]) -> list[dict[str, Any]]:
     """Reconstruct episode and turn token ranges from packed-cache provenance."""
 
@@ -136,7 +177,6 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
     language = Counter()
     categories = Counter()
     block_metrics = []
-    clarification_texts: list[str] = []
     for row, text in zip(tokens, texts):
         metric = _token_metrics(row.tolist())
         block_metrics.append(metric)
@@ -151,10 +191,7 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
             if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
                 categories[category] += 1
     semantic_texts = assistant_texts if assistant_texts else texts
-    for text in semantic_texts:
-        if CLARIFICATION_PATTERN.search(text):
-            clarification_texts.append(" ".join(text.split()).lower())
-    clarification_counts = Counter(clarification_texts)
+    episode_texts = [tokenizer.decode(item["tokens"], skip_special_tokens=True) for item in episodes]
     health = {
         "cache": str(cache.expanduser().resolve()),
         "protocol_name": payload.get("protocol_name"),
@@ -164,10 +201,10 @@ def inspect_cache(cache: Path, model_path: Path, sample_count: int) -> dict[str,
         "language_rows": dict(sorted(language.items())),
         "overlapping_category_rows": dict(sorted(categories.items())),
         "semantic_modes": {
-            "clarification_rows": len(clarification_texts),
-            "clarification_rate": len(clarification_texts) / max(len(texts), 1),
-            "distinct_clarification_forms": len(clarification_counts),
-            "top_clarification_forms": clarification_counts.most_common(10),
+            "block": _semantic_modes(texts),
+            "episode": _semantic_modes(episode_texts),
+            "user": _semantic_modes(user_texts),
+            "assistant": _semantic_modes(assistant_texts),
         },
         "quality": {
             "block": _aggregate_quality(block_metrics),

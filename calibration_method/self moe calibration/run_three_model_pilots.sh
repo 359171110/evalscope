@@ -15,6 +15,7 @@ NAMES=(qwen3 qwen36 gemma4)
 GPUS=(${GPUS:-0 1 2})
 MEMORY=(0.85 0.96 0.85)
 EAGER=(0 1 0)
+MODES=(user_role_continuation user_role_continuation assistant_bootstrap)
 
 if [[ ${#GPUS[@]} -ne 3 ]]; then
   echo "GPUS must contain exactly three GPU indexes" >&2
@@ -44,6 +45,7 @@ for i in 0 1 2; do
     --episode-batch-size 4
     --max-user-tokens 64
     --max-assistant-tokens 128
+    --user-generation-mode "${MODES[$i]}"
     --gpu-memory-utilization "${MEMORY[$i]}"
     --seed 42
     --force

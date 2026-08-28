@@ -22,7 +22,7 @@ from src.calibration_data import build_model_cache_identity
 
 
 SENTINEL = "__CN_MOE_SC_USER_SENTINEL_7F3A__"
-PROTOCOL_VERSION = "cn_moe_sc_native_dialogue_v2"
+PROTOCOL_VERSION = "cn_moe_sc_native_dialogue_v2_minimal_intervention"
 
 
 @dataclass(frozen=True)
@@ -322,7 +322,12 @@ def _is_valid_turn(
     role: str,
     tokenizer: Any | None = None,
 ) -> tuple[bool, dict[str, Any]]:
-    """Apply a strict pre-response gate to user content and a general gate to assistant content."""
+    """Reject only empty or mechanically degenerate turns.
+
+    Text style, semantic mode, language, and lexical repetition are deliberately
+    diagnostic-only.  This keeps clarification, refusal, list, boilerplate,
+    and multilingual behavior in the measured model distribution.
+    """
 
     tokens = list(token_ids)
     metrics = _repeat_metrics(tokens)
@@ -335,24 +340,15 @@ def _is_valid_turn(
         "words": 0.0,
     }
     metrics = {**metrics, **text_metrics}
-    if role == "user":
-        valid = (
-            len(tokens) >= 16
-            and metrics["distinct_token_ratio"] >= 0.08
-            and metrics["dominant_token_ratio"] <= 0.25
-            and metrics["max_run_ratio"] <= 0.15
-            and metrics["repeated_4gram_ratio"] <= 0.60
-            and metrics["periodic_loop_ratio"] <= 0.25
-        )
-    else:
-        valid = (
-            len(tokens) >= 16
-            and metrics["distinct_token_ratio"] >= 0.02
-            and metrics["dominant_token_ratio"] <= 0.50
-            and metrics["max_run_ratio"] <= 0.25
-            and metrics["repeated_4gram_ratio"] <= 0.85
-            and metrics["periodic_loop_ratio"] <= 0.50
-        )
+    valid = (
+        bool(tokens)
+        and (tokenizer is None or bool(text.strip()))
+        and metrics["distinct_token_ratio"] >= 0.02
+        and metrics["dominant_token_ratio"] <= 0.85
+        and metrics["max_run_ratio"] <= 0.60
+        and metrics["repeated_4gram_ratio"] <= 0.90
+        and metrics["periodic_loop_ratio"] <= 0.60
+    )
     return valid, metrics
 
 
