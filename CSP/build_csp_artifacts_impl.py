@@ -164,7 +164,7 @@ def build_channel_payload(
         "block_size": architecture.channel_alignment,
         "score_mode": (
             "per_expert_canonical_structural_participation_fp32"
-            if canonicalize else "per_expert_structural_participation_fp32"
+            if canonicalize else "per_expert_structural_participation_aimer_compatible_fp32"
         ),
         "table": tables,
         "csp": {
@@ -172,6 +172,10 @@ def build_channel_payload(
             "weight_only": True,
             "accumulator_dtype": "float32",
             "functional_viability_threshold": DEFAULT_FUNCTIONAL_VIABILITY_THRESHOLD,
+            "raw_ranking_eps": 1.0e-8 if not canonicalize and not apply_input_scale else None,
+            "raw_ranking_compatibility": (
+                "aimer_channel_fp32" if not canonicalize and not apply_input_scale else "not_applicable"
+            ),
             "input_scale_mode": "gemma4_pre_feedforward_layernorm_2" if apply_input_scale else "none",
             "criterion": (
                 "log_renyi2_divergence_from_uniform_canonical_signature"

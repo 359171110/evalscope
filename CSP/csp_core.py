@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 DEFAULT_FUNCTIONAL_VIABILITY_THRESHOLD = 1.0e-12
+DEFAULT_AIMER_EPS = 1.0e-8
 
 
 def file_sha256(path: Path) -> str:
@@ -92,6 +93,19 @@ def canonical_structural_score(
     down_f = down.detach().to(dtype=torch.float32).transpose(0, 1)
     if not bool(torch.isfinite(gate_f).all() and torch.isfinite(up_f).all() and torch.isfinite(down_f).all()):
         raise ValueError("CSP inputs must contain only finite values.")
+
+    if not canonicalize and input_scale is None:
+        # Keep raw CSP channel ranking bit-compatible with AIMER-Channel.
+        # Both methods then consume the same FP32 sums, epsilon, and channel
+        # viability rule; the CSP score remains a monotonic transform.
+        numel = float(3 * hidden_size)
+        abs_sum = gate_f.abs().sum(dim=1) + up_f.abs().sum(dim=1) + down_f.abs().sum(dim=1)
+        energy = gate_f.square().sum(dim=1) + up_f.square().sum(dim=1) + down_f.square().sum(dim=1)
+        aimer_score = (energy / numel).sqrt() / (abs_sum / numel + DEFAULT_AIMER_EPS)
+        viable = (energy >= float(functional_viability_threshold)) & (abs_sum > 0.0)
+        direct_score = 2.0 * aimer_score.log()
+        if bool(torch.isfinite(direct_score[viable]).all()):
+            return torch.where(viable, direct_score, torch.full_like(direct_score, float("-inf"))).to(dtype=torch.float32)
 
     log_gate_l1 = _log_l1(gate_f)
     log_up_l1 = _log_l1(up_f)

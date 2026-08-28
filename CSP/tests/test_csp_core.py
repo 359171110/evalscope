@@ -53,8 +53,26 @@ def test_csp_packed_matches_split_and_dead_path_is_excluded() -> None:
         canonical_structural_score_packed(packed, down),
         canonical_structural_score(gate, up, down),
     )
-    dead = canonical_structural_score(gate, torch.zeros_like(up), down)
+    dead = canonical_structural_score(
+        torch.zeros_like(gate), torch.zeros_like(up), torch.zeros_like(down),
+    )
     assert bool(torch.isneginf(dead).all())
+
+
+def test_raw_csp_ranking_is_bit_compatible_with_aimer_channel() -> None:
+    generator = torch.Generator().manual_seed(42)
+    gate = torch.randn(32, 17, generator=generator)
+    up = torch.randn(32, 17, generator=generator)
+    down = torch.randn(17, 32, generator=generator)
+    numel = float(3 * gate.shape[1])
+    abs_sum = gate.abs().sum(dim=1) + up.abs().sum(dim=1) + down.transpose(0, 1).abs().sum(dim=1)
+    energy = gate.square().sum(dim=1) + up.square().sum(dim=1) + down.transpose(0, 1).square().sum(dim=1)
+    aimer = (energy / numel).sqrt() / (abs_sum / numel + 1.0e-8)
+    csp = canonical_structural_score(gate, up, down)
+    assert torch.equal(
+        torch.argsort(csp, descending=True, stable=True),
+        torch.argsort(aimer, descending=True, stable=True),
+    )
 
 
 def test_csp_ranking_ties_and_complete_table_are_deterministic() -> None:
