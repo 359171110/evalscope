@@ -10,13 +10,22 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 MODEL="${1:-}"
 RETAINED_CHANNELS="${2:-}"
 OUTPUT_ROOT="${3:-$CSP_ROOT/experiments}"
+HETEROGENEOUS_WIDTHS="${CSP_HETEROGENEOUS_WIDTHS:-}"
+BUDGET_WIDTH="${CSP_BUDGET_WIDTH:-}"
 
 die() {
     echo "ERROR: $*" >&2
     exit 2
 }
 
-[[ -n "$MODEL" && -n "$RETAINED_CHANNELS" ]] || die "Usage: $0 MODEL RETAINED_CHANNELS OUTPUT_ROOT"
+if [[ -n "$HETEROGENEOUS_WIDTHS" || -n "$BUDGET_WIDTH" ]]; then
+    [[ "$MODEL" != "all" ]] || die "Use one model at a time in heterogeneous mode."
+    [[ -n "$HETEROGENEOUS_WIDTHS" && -n "$BUDGET_WIDTH" ]] || die "Set CSP_HETEROGENEOUS_WIDTHS and CSP_BUDGET_WIDTH together."
+    [[ -z "$RETAINED_CHANNELS" ]] || die "Do not pass RETAINED_CHANNELS in heterogeneous mode."
+    [[ -z "${CSP_CANONICALIZE:-}" ]] || die "HSP-Hetero uses raw Expert-SP and raw Channel-SP; do not set CSP_CANONICALIZE."
+else
+    [[ -n "$MODEL" && -n "$RETAINED_CHANNELS" ]] || die "Usage: $0 MODEL RETAINED_CHANNELS OUTPUT_ROOT"
+fi
 case "$MODEL" in
     qwen3) DEFAULT_MODEL_PATH="${QWEN3_MODEL_PATH:-/data01/datasets/Qwen3-30B-A3B-Instruct-2507}" ;;
     qwen36) DEFAULT_MODEL_PATH="${QWEN36_MODEL_PATH:-/data01/datasets/Qwen3.6-35B-A3B}" ;;
@@ -29,19 +38,43 @@ MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
 [[ -n "$MODEL_PATH" ]] || die "Set the corresponding model path environment variable."
 [[ -d "$MODEL_PATH" ]] || die "Model path does not exist: $MODEL_PATH"
 
-ARTIFACT_ROOT="$OUTPUT_ROOT/$MODEL"
+if [[ -n "$HETEROGENEOUS_WIDTHS" ]]; then
+    case "$MODEL:$BUDGET_WIDTH:$HETEROGENEOUS_WIDTHS" in
+        qwen3:384:"320 384 448") ;;
+        qwen36:256:"192 256 320") ;;
+        gemma4:352:"288 352 416") ;;
+        deepseek:704:"576 704 832") ;;
+        *) die "Unsupported HSP-Hetero configuration for $MODEL: widths='$HETEROGENEOUS_WIDTHS', budget='$BUDGET_WIDTH'." ;;
+    esac
+    ARTIFACT_ROOT="$OUTPUT_ROOT/${MODEL}_heterogeneous_${HETEROGENEOUS_WIDTHS// /_}_budget${BUDGET_WIDTH}"
+else
+    ARTIFACT_ROOT="$OUTPUT_ROOT/$MODEL"
+fi
 CACHE="$ARTIFACT_ROOT/csp_rankings.pt"
-PROFILE="$ARTIFACT_ROOT/csp_${RETAINED_CHANNELS}ch.pt"
-CHECKPOINT="$ARTIFACT_ROOT/checkpoint_${RETAINED_CHANNELS}ch"
+if [[ -n "$HETEROGENEOUS_WIDTHS" ]]; then
+    PROFILE="$ARTIFACT_ROOT/csp_heterogeneous_budget${BUDGET_WIDTH}ch.pt"
+    CHECKPOINT="$ARTIFACT_ROOT/checkpoint_heterogeneous_${HETEROGENEOUS_WIDTHS// /_}_budget${BUDGET_WIDTH}"
+else
+    PROFILE="$ARTIFACT_ROOT/csp_${RETAINED_CHANNELS}ch.pt"
+    CHECKPOINT="$ARTIFACT_ROOT/checkpoint_${RETAINED_CHANNELS}ch"
+fi
 mkdir -p "$ARTIFACT_ROOT"
 
 export PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}"
-"$PYTHON_BIN" -m CSP.build_csp_artifacts \
+build_args=(
+    "$PYTHON_BIN" -m CSP.build_csp_artifacts
     --model-path "$MODEL_PATH" \
     --output-channel-cache "$CACHE" \
-    --output-profile "$PROFILE" \
-    --retained-channels "$RETAINED_CHANNELS" \
-    ${CSP_CANONICALIZE:+--canonicalize}
+    --output-profile "$PROFILE"
+)
+if [[ -n "$HETEROGENEOUS_WIDTHS" ]]; then
+    read -r -a width_options <<< "$HETEROGENEOUS_WIDTHS"
+    build_args+=(--heterogeneous-widths "${width_options[@]}" --budget-width "$BUDGET_WIDTH")
+else
+    build_args+=(--retained-channels "$RETAINED_CHANNELS")
+fi
+[[ -n "${CSP_CANONICALIZE:-}" ]] && build_args+=(--canonicalize)
+"${build_args[@]}"
 if [[ -f "$CHECKPOINT/pruning_export_manifest.json" ]]; then
     printf 'checkpoint=%s\n' "$CHECKPOINT"
     exit 0

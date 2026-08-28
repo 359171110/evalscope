@@ -40,14 +40,40 @@ def expert_id_from_name(name: str) -> int:
     return int(name.split(marker, 1)[1].split(".", 1)[0])
 
 
-def retained_table(cache: dict[str, Any], retained_channels: int) -> dict[tuple[int, int], torch.Tensor]:
-    """Materialize only the retained prefix of each ranking."""
+def retained_table(
+    cache: dict[str, Any], profile: dict[str, Any]
+) -> dict[tuple[int, int], torch.Tensor]:
+    """Materialize each expert's logical retained CSP prefix."""
 
+    widths = profile["profile_widths"].to(dtype=torch.long)
+    layer_ids = [int(layer_id) for layer_id in profile["layer_ids"]]
+    block_size = int(profile["channel_block_size"])
     return {
-        (int(layer_id), expert_id): row[:retained_channels].long()
-        for layer_id, values in cache["table"].items()
-        for expert_id, row in enumerate(values["ranked_indices"])
+        (layer_id, expert_id): cache["table"][layer_id]["ranked_indices"][expert_id, :int(widths[row, expert_id]) * block_size].long()
+        for row, layer_id in enumerate(layer_ids)
+        for expert_id in range(int(profile["num_experts"]))
     }
+
+
+def pad_rows(source: torch.Tensor, width: int) -> torch.Tensor:
+    """Pad the first tensor dimension with exact zeros."""
+
+    if int(source.shape[0]) > int(width):
+        raise ValueError("source rows exceed the requested padded width.")
+    if int(source.shape[0]) == int(width):
+        return source
+    return torch.cat((source, torch.zeros((int(width) - int(source.shape[0]), *source.shape[1:]), dtype=source.dtype)), dim=0)
+
+
+def pad_columns(source: torch.Tensor, width: int) -> torch.Tensor:
+    """Pad the last tensor dimension with exact zeros."""
+
+    if int(source.shape[-1]) > int(width):
+        raise ValueError("source columns exceed the requested padded width.")
+    if int(source.shape[-1]) == int(width):
+        return source
+    shape = (*source.shape[:-1], int(width) - int(source.shape[-1]))
+    return torch.cat((source, torch.zeros(shape, dtype=source.dtype)), dim=-1)
 
 
 def fused_shared_expert_width(text_config: dict[str, Any]) -> int | None:
@@ -96,6 +122,7 @@ def prune_routed_tensor(
     source: torch.Tensor,
     adapter: CSPModelAdapter,
     retained: dict[tuple[int, int], torch.Tensor],
+    padded_width: int | None = None,
 ) -> tuple[torch.Tensor, bool]:
     """Slice routed gate/up rows and down columns; preserve every other tensor."""
 
@@ -115,13 +142,14 @@ def prune_routed_tensor(
             for expert_id in range(architecture.num_experts):
                 indices = retained[(layer_id, expert_id)]
                 packed_indices = torch.cat((indices, indices + architecture.intermediate_size))
-                selected.append(source[expert_id].index_select(0, packed_indices))
+                expert = source[expert_id].index_select(0, packed_indices)
+                selected.append(pad_rows(expert, 2 * int(padded_width)) if padded_width is not None else expert)
             return torch.stack(selected), True
         if name == adapter.down_name(layer_id):
-            return torch.stack([
-                source[expert_id].index_select(1, retained[(layer_id, expert_id)])
-                for expert_id in range(architecture.num_experts)
-            ]), True
+            selected = [source[expert_id].index_select(1, retained[(layer_id, expert_id)]) for expert_id in range(architecture.num_experts)]
+            if padded_width is not None:
+                selected = [pad_columns(expert, int(padded_width)) for expert in selected]
+            return torch.stack(selected), True
         return source, False
 
     if ".experts." not in name:
@@ -135,14 +163,16 @@ def prune_routed_tensor(
         return source, False
     indices = retained[(layer_id, expert_id)]
     if name in {adapter.gate_name(layer_id, expert_id), adapter.up_name(layer_id, expert_id)}:
-        return source.index_select(0, indices), True
+        selected = source.index_select(0, indices)
+        return pad_rows(selected, padded_width) if padded_width is not None else selected, True
     if name == adapter.down_name(layer_id, expert_id):
-        return source.index_select(1, indices), True
+        selected = source.index_select(1, indices)
+        return pad_columns(selected, padded_width) if padded_width is not None else selected, True
     return source, False
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Export a uniformly CSP-pruned MoE checkpoint.")
+    parser = argparse.ArgumentParser(description="Export a CSP-pruned MoE checkpoint.")
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--profile", type=Path, required=True)
     parser.add_argument("--channel-cache", type=Path, required=True)
@@ -162,8 +192,8 @@ def main() -> int:
     profile = torch.load(profile_path, map_location="cpu", weights_only=True)
     cache = torch.load(channel_path, map_location="cpu", weights_only=True)
     validate_static_profile_payload(profile)
-    if profile.get("method") != "csp" or cache.get("purpose") != "csp_channel_ranking":
-        raise ValueError("Expected a CSP profile and CSP channel ranking cache.")
+    if profile.get("method") not in {"csp", "hsp"} or cache.get("purpose") != "csp_channel_ranking":
+        raise ValueError("Expected a CSP/HSP profile and CSP channel ranking cache.")
     if profile["cache_provenance"]["channel"]["sha256"] != file_sha256(channel_path):
         raise ValueError("CSP channel cache SHA256 does not match the profile.")
     index_path = model_path / "model.safetensors.index.json"
@@ -179,12 +209,28 @@ def main() -> int:
     if model_provenance.get("weight_index_sha256") != file_sha256(index_path):
         raise ValueError("Checkpoint weight index changed after CSP ranking construction.")
     widths = profile["profile_widths"].long()
-    if not bool((widths == widths.flatten()[0]).all()):
-        raise ValueError("A standard HF checkpoint requires one uniform expert width.")
-    retained_channels = int(widths.flatten()[0].item()) * int(profile["channel_block_size"])
+    heterogeneous = profile.get("allocation_scope") == "per_layer_expert_sp_quantiles"
+    if heterogeneous:
+        if architecture.model_family not in {"qwen3", "qwen3.6", "gemma4", "deepseek_v2"}:
+            raise ValueError("heterogeneous CSP export does not support this model family.")
+        if cache.get("csp", {}).get("canonicalization") is not False:
+            raise ValueError("heterogeneous CSP export requires raw Expert-SP and raw Channel-SP scoring.")
+        padded_width = int(profile.get("padded_intermediate_size", 0))
+        width_options = [int(width) for width in profile.get("width_options", [])]
+        if not width_options or padded_width != max(width_options):
+            raise ValueError("heterogeneous CSP profile must declare width_options and padded_intermediate_size.")
+        if bool((widths * int(profile["channel_block_size"]) > padded_width).any()):
+            raise ValueError("heterogeneous logical widths cannot exceed padded width.")
+        retained_channels = int(profile.get("budget_reference_width", 0))
+    else:
+        if not bool((widths == widths.flatten()[0]).all()):
+            raise ValueError("A standard HF checkpoint requires one uniform expert width.")
+        retained_channels = int(widths.flatten()[0].item()) * int(profile["channel_block_size"])
+        padded_width = None
+        width_options = [retained_channels]
     architecture.validate_width(retained_channels)
     validate_rankings(cache["table"], len(architecture.moe_layer_ids()), architecture.num_experts, architecture.intermediate_size, layer_ids=architecture.moe_layer_ids())
-    retained = retained_table(cache, retained_channels)
+    retained = retained_table(cache, profile)
 
     changed_tensors = 0
     shape_changes: dict[str, Any] = {}
@@ -194,7 +240,7 @@ def main() -> int:
         with safe_open(model_path / shard_name, framework="pt", device="cpu") as handle:
             for name in handle.keys():
                 source = handle.get_tensor(name)
-                changed, did_change = prune_routed_tensor(name, source, adapter, retained)
+                changed, did_change = prune_routed_tensor(name, source, adapter, retained, padded_width)
                 changed_tensors += int(did_change)
                 tensors[name] = changed.contiguous()
                 total_size += changed.numel() * changed.element_size()
@@ -216,7 +262,8 @@ def main() -> int:
     config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
     text_config = config.get("text_config", config)
     exported_shared_width = fused_shared_expert_width(text_config) if architecture.model_family == "deepseek_v2" else None
-    text_config["moe_intermediate_size"] = retained_channels
+    exported_width = int(padded_width) if heterogeneous else retained_channels
+    text_config["moe_intermediate_size"] = exported_width
     if exported_shared_width is not None:
         text_config["shared_expert_intermediate_size"] = exported_shared_width
     (output_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -227,7 +274,7 @@ def main() -> int:
 
     manifest = {
         "schema_version": 1,
-        "method": "csp",
+        "method": "hsp" if heterogeneous else "csp",
         "model_family": architecture.model_family,
         "source_model": str(model_path),
         "source_config_sha256": file_sha256(model_path / "config.json"),
@@ -239,10 +286,14 @@ def main() -> int:
         "score_mode": cache["score_mode"],
         "input_scale_mode": cache["csp"]["input_scale_mode"],
         "retained_channels": retained_channels,
+        "logical_widths_by_layer": (widths * int(profile["channel_block_size"])).tolist() if heterogeneous else None,
+        "width_options": width_options,
+        "padded_intermediate_size": exported_width,
+        "allocation_scope": profile.get("allocation_scope"),
         "source_expert_width": architecture.intermediate_size,
-        "exported_moe_intermediate_size": retained_channels,
+        "exported_moe_intermediate_size": exported_width,
         "exported_shared_expert_intermediate_size": exported_shared_width,
-        "export_layout": "slice_uniform_width",
+        "export_layout": "slice_uniform_width_padded" if heterogeneous else "slice_uniform_width",
         "actual_structural_pruning_ratio": 1.0 - retained_channels / architecture.intermediate_size,
         "changed_routed_expert_tensors": changed_tensors,
         "exported_weight_bytes": total_size,

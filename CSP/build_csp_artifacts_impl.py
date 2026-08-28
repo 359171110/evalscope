@@ -13,6 +13,8 @@ from safetensors import safe_open
 from CSP.csp_core import (
     DEFAULT_FUNCTIONAL_VIABILITY_THRESHOLD,
     canonical_structural_score,
+    expert_structural_score,
+    expert_structural_score_packed,
     file_sha256,
     canonical_structural_score_packed,
     ranking_table,
@@ -49,23 +51,28 @@ def score_separate_layer(
     layer_id: int,
     apply_input_scale: bool,
     canonicalize: bool,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Score every separate-layout routed expert in one layer."""
 
     scale = tensors.get(adapter.input_scale_name(layer_id)) if apply_input_scale else None
     rows = []
+    expert_scores = []
     for expert_id in range(adapter.architecture.num_experts):
+        gate = tensors[adapter.gate_name(layer_id, expert_id)]
+        up = tensors[adapter.up_name(layer_id, expert_id)]
+        down = tensors[adapter.down_name(layer_id, expert_id)]
         rows.append(
             canonical_structural_score(
-                tensors[adapter.gate_name(layer_id, expert_id)],
-                tensors[adapter.up_name(layer_id, expert_id)],
-                tensors[adapter.down_name(layer_id, expert_id)],
+                gate,
+                up,
+                down,
                 input_scale=scale,
                 functional_viability_threshold=DEFAULT_FUNCTIONAL_VIABILITY_THRESHOLD,
                 canonicalize=canonicalize,
             )
         )
-    return torch.stack(rows)
+        expert_scores.append(expert_structural_score(gate, up, down))
+    return torch.stack(rows), torch.stack(expert_scores)
 
 
 def score_packed_layer(
@@ -74,7 +81,7 @@ def score_packed_layer(
     layer_id: int,
     apply_input_scale: bool,
     canonicalize: bool,
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Score every packed routed expert in one layer."""
 
     gate_up = tensors[adapter.gate_up_name(layer_id)]
@@ -92,9 +99,13 @@ def score_packed_layer(
         )
         for expert_id in range(adapter.architecture.num_experts)
     ])
+    expert_scores = torch.stack([
+        expert_structural_score_packed(gate_up[expert_id], down[expert_id])
+        for expert_id in range(adapter.architecture.num_experts)
+    ])
     if scores.shape[1] != adapter.architecture.intermediate_size:
         raise ValueError("Packed CSP width does not match moe_intermediate_size.")
-    return scores
+    return scores, expert_scores
 
 
 def build_layer_rankings(
@@ -112,10 +123,12 @@ def build_layer_rankings(
         if apply_input_scale and adapter.input_scale_name(layer_id) not in tensors:
             raise KeyError(f"Missing required CSP input scale for layer {layer_id}.")
         if adapter.architecture.tensor_codec == "packed":
-            scores = score_packed_layer(adapter, tensors, layer_id, apply_input_scale, canonicalize)
+            scores, expert_scores = score_packed_layer(adapter, tensors, layer_id, apply_input_scale, canonicalize)
         else:
-            scores = score_separate_layer(adapter, tensors, layer_id, apply_input_scale, canonicalize)
-        tables[int(layer_id)] = ranking_table(scores, adapter.architecture.channel_alignment)
+            scores, expert_scores = score_separate_layer(adapter, tensors, layer_id, apply_input_scale, canonicalize)
+        table = ranking_table(scores, adapter.architecture.channel_alignment)
+        table["expert_structural_scores"] = expert_scores.to(dtype=torch.float32).cpu()
+        tables[int(layer_id)] = table
         print(f"scored_layer={layer_id}", flush=True)
     return tables
 
@@ -229,6 +242,120 @@ def build_profile(
     return profile
 
 
+def build_heterogeneous_profile(
+    *,
+    model_path: Path,
+    adapter: CSPModelAdapter,
+    tables: dict[int, dict[str, torch.Tensor | int]],
+    width_options: list[int],
+    budget_width: int,
+    apply_input_scale: bool,
+    canonicalize: bool,
+) -> dict[str, Any]:
+    """Build an HSP-Hetero profile with fixed Expert-SP quantile tiers."""
+
+    architecture = adapter.architecture
+    if architecture.model_family not in {"qwen3", "qwen3.6", "gemma4", "deepseek_v2"}:
+        raise ValueError("HSP-Hetero does not support this model family.")
+    if canonicalize:
+        raise ValueError("HSP-Hetero uses raw Expert-SP and raw Channel-SP; canonicalization is not supported.")
+    block_size = architecture.channel_alignment
+    options = sorted({int(width) for width in width_options})
+    if len(options) != 3:
+        raise ValueError("HSP-Hetero requires exactly three width options.")
+    for width in options:
+        architecture.validate_width(width)
+    architecture.validate_width(int(budget_width))
+    if options[1] != int(budget_width) or options[1] - options[0] != options[2] - options[1]:
+        raise ValueError("HSP-Hetero width options must be symmetric around budget_width.")
+    if architecture.num_experts % 4:
+        raise ValueError("HSP-Hetero requires the number of experts to be divisible by four.")
+
+    moe_ids = architecture.moe_layer_ids()
+    widths_by_layer = []
+    expert_scores_by_layer = []
+    width_histograms = []
+    target_blocks = architecture.num_experts * int(budget_width) // block_size
+    for layer_id in moe_ids:
+        expert_scores = tables[int(layer_id)].get("expert_structural_scores")
+        if not isinstance(expert_scores, torch.Tensor) or tuple(expert_scores.shape) != (architecture.num_experts,):
+            raise ValueError(f"Layer {layer_id} is missing HSP Expert-SP scores.")
+        order = torch.argsort(expert_scores, descending=True, stable=True)
+        quarter = architecture.num_experts // 4
+        layer_widths = torch.full(
+            (architecture.num_experts,), int(budget_width) // block_size, dtype=torch.long
+        )
+        layer_widths[order[:quarter]] = options[2] // block_size
+        layer_widths[order[-quarter:]] = options[0] // block_size
+        widths_by_layer.append(layer_widths)
+        expert_scores_by_layer.append(expert_scores.tolist())
+        counts = {str(width): int((layer_widths == width // block_size).sum().item()) for width in options}
+        width_histograms.append(counts)
+
+    widths = torch.stack(widths_by_layer)
+    if widths.sum(dim=1).tolist() != [target_blocks] * len(moe_ids):
+        raise RuntimeError("heterogeneous CSP allocation violated the exact per-layer budget.")
+    num_blocks = architecture.intermediate_size // block_size
+    total_blocks = int(widths.sum().item())
+    maximum_blocks = int(widths.numel() * num_blocks)
+    actual_ratio = 1.0 - int(budget_width) / architecture.intermediate_size
+    profile = {
+        "schema_version": 1,
+        "method": "hsp",
+        "mode": "hsp_hetero_raw_expert_sp_quantiles",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "model_path": str(model_path),
+        "model_family": architecture.model_family,
+        "profile_construction": "calibration_free",
+        "calibration_split": "not_applicable",
+        "calibration_frozen_before_evaluation": True,
+        "test_metrics_used_for_profile": False,
+        "layer_ids": list(moe_ids),
+        "num_layers": len(moe_ids),
+        "num_experts": architecture.num_experts,
+        "num_blocks": num_blocks,
+        "channel_block_size": block_size,
+        "intermediate_size": architecture.intermediate_size,
+        "allocation_scope": "per_layer_expert_sp_quantiles",
+        "allocation_objective": (
+            f"top_25_percent_expert_sp_to_{options[2]}_middle_50_percent_to_{options[1]} "
+            f"bottom_25_percent_to_{options[0]}"
+        ),
+        "target_blocks_by_layer": [target_blocks] * len(moe_ids),
+        "actual_blocks_by_layer": widths.sum(dim=1).tolist(),
+        "total_blocks": total_blocks,
+        "maximum_blocks": maximum_blocks,
+        "target_pruning_ratio": actual_ratio,
+        "actual_structural_pruning_ratio": actual_ratio,
+        "retained_channels": None,
+        "budget_reference_width": int(budget_width),
+        "width_options": options,
+        "padded_intermediate_size": options[-1],
+        "retained_expert_mask": None,
+        "profile_widths": widths,
+        "profile_sha256": hashlib.sha256(widths.numpy().tobytes(order="C")).hexdigest(),
+        "csp": {
+            "data_free": True,
+            "weight_only": True,
+            "accumulator_dtype": "float32",
+            "input_scale_mode": "gemma4_pre_feedforward_layernorm_2" if apply_input_scale else "none",
+            "canonicalization": canonicalize,
+            "architecture": adapter.metadata(),
+            "heterogeneous_allocation": {
+                "expert_score": "log(N_E * ||Theta_e||_2^2 / ||Theta_e||_1^2)",
+                "expert_score_canonicalization": False,
+                "allocation": "layerwise_quantiles_25_50_25",
+                "width_options": options,
+                "budget_reference_width": int(budget_width),
+                "expert_structural_scores_by_layer": expert_scores_by_layer,
+                "width_histograms_by_layer": width_histograms,
+            },
+        },
+    }
+    validate_static_profile_payload(profile)
+    return profile
+
+
 def write_profile(profile: dict[str, Any], profile_path: Path) -> None:
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(profile, profile_path)
@@ -237,16 +364,25 @@ def write_profile(profile: dict[str, Any], profile_path: Path) -> None:
     profile_path.with_suffix(".json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def write_retained_indices(channel: dict[str, Any], retained_channels: int, output_path: Path) -> None:
+def write_retained_indices(channel: dict[str, Any], profile: dict[str, Any], output_path: Path) -> None:
+    block_size = int(profile["channel_block_size"])
+    layer_ids = [int(layer_id) for layer_id in profile["layer_ids"]]
+    widths = profile["profile_widths"].to(dtype=torch.long)
     output_path.write_text(
         json.dumps({
             "schema_version": 1,
             "method": "csp",
-            "retained_channels": int(retained_channels),
+            "retained_channels": profile.get("retained_channels"),
+            "budget_reference_width": profile.get("budget_reference_width"),
+            "width_options": profile.get("width_options"),
             "layer_ids": sorted(int(layer_id) for layer_id in channel["table"]),
+            "widths_by_layer": (widths * block_size).tolist(),
             "retained_indices": {
-                str(int(layer_id)): table["ranked_indices"][:, :int(retained_channels)].tolist()
-                for layer_id, table in channel["table"].items()
+                str(layer_id): [
+                    channel["table"][layer_id]["ranked_indices"][expert_id, :int(widths[row, expert_id].item()) * block_size].tolist()
+                    for expert_id in range(int(profile["num_experts"]))
+                ]
+                for row, layer_id in enumerate(layer_ids)
             },
         }, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
@@ -288,6 +424,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-profile", type=Path, required=True)
     parser.add_argument("--target-pruning-ratio", type=float)
     parser.add_argument("--retained-channels", type=int)
+    parser.add_argument("--heterogeneous-widths", type=int, nargs="+")
+    parser.add_argument("--budget-width", type=int)
     parser.add_argument("--rounding", choices=("floor", "nearest", "ceil"), default="nearest")
     parser.add_argument("--apply-input-scale", choices=("auto", "always", "never"), default="auto")
     parser.add_argument(
@@ -299,7 +437,13 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    if (args.retained_channels is None) == (args.target_pruning_ratio is None):
+    heterogeneous = args.heterogeneous_widths is not None or args.budget_width is not None
+    if heterogeneous:
+        if args.heterogeneous_widths is None or args.budget_width is None:
+            raise ValueError("Provide both --heterogeneous-widths and --budget-width.")
+        if args.retained_channels is not None or args.target_pruning_ratio is not None:
+            raise ValueError("Heterogeneous CSP cannot be combined with a uniform width or pruning ratio.")
+    elif (args.retained_channels is None) == (args.target_pruning_ratio is None):
         raise ValueError("Provide exactly one of --retained-channels or --target-pruning-ratio.")
     model_path = args.model_path.expanduser().resolve()
     channel_path = args.output_channel_cache.expanduser().resolve()
@@ -310,18 +454,27 @@ def main() -> int:
         args.apply_input_scale == "auto" and adapter.architecture.model_family == "gemma4"
     )
     canonicalize = bool(args.canonicalize)
+    heterogeneous = args.heterogeneous_widths is not None or args.budget_width is not None
+    if heterogeneous and apply_input_scale:
+        if args.apply_input_scale == "always":
+            raise ValueError("HSP-Hetero uses raw parameter signatures and does not support input scaling.")
+        apply_input_scale = False
     if apply_input_scale and adapter.input_scale_template is None:
         if args.apply_input_scale == "always":
             raise ValueError(f"{adapter.architecture.model_family} has no supported expert input scale.")
         apply_input_scale = False
     architecture = adapter.architecture
-    if args.retained_channels is not None:
+    if heterogeneous:
+        retained_channels = None
+        target_ratio = 1.0 - int(args.budget_width) / architecture.intermediate_size
+    elif args.retained_channels is not None:
         retained_channels = int(args.retained_channels)
         target_ratio = 1.0 - retained_channels / architecture.intermediate_size
     else:
         target_ratio = float(args.target_pruning_ratio)
         retained_channels = architecture.width_for_pruning(target_ratio, args.rounding)
-    architecture.validate_width(retained_channels)
+    if retained_channels is not None:
+        architecture.validate_width(retained_channels)
     if channel_path.exists():
         channel = torch.load(channel_path, map_location="cpu", weights_only=True)
         validate_existing_cache(
@@ -340,17 +493,32 @@ def main() -> int:
         )
         channel_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(channel, channel_path)
-    profile = build_profile(
-        model_path=model_path,
-        adapter=adapter,
-        retained_channels=retained_channels,
-        target_pruning_ratio=target_ratio,
-        apply_input_scale=apply_input_scale,
-        canonicalize=canonicalize,
-    )
+    if heterogeneous:
+        profile = build_heterogeneous_profile(
+            model_path=model_path,
+            adapter=adapter,
+            tables=channel["table"],
+            width_options=list(args.heterogeneous_widths),
+            budget_width=int(args.budget_width),
+            apply_input_scale=apply_input_scale,
+            canonicalize=canonicalize,
+        )
+    else:
+        profile = build_profile(
+            model_path=model_path,
+            adapter=adapter,
+            retained_channels=int(retained_channels),
+            target_pruning_ratio=target_ratio,
+            apply_input_scale=apply_input_scale,
+            canonicalize=canonicalize,
+        )
     profile["cache_provenance"] = {"channel": {"path": str(channel_path), "sha256": file_sha256(channel_path), "role": "csp_ranking"}}
     write_profile(profile, profile_path)
-    write_retained_indices(channel, retained_channels, profile_path.with_name(f"csp_retained_{retained_channels}ch.json"))
+    retained_name = (
+        f"csp_retained_heterogeneous_budget{args.budget_width}ch.json"
+        if heterogeneous else f"csp_retained_{retained_channels}ch.json"
+    )
+    write_retained_indices(channel, profile, profile_path.with_name(retained_name))
     if abs(profile["actual_structural_pruning_ratio"] - target_ratio) > 1.0e-12:
         print(f"WARNING: requested pruning ratio {target_ratio:.8f} was aligned to {profile['actual_structural_pruning_ratio']:.8f} ({retained_channels} channels).", flush=True)
     print(channel_path)

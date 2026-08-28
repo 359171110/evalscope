@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from CSP.csp_core import (
     canonical_structural_score,
     canonical_structural_score_packed,
+    allocate_participation_widths,
+    participation_block_spectrum,
     rank_channels_by_csp,
     ranking_table,
     retained_prefix,
@@ -88,3 +91,30 @@ def test_csp_score_matches_explicit_canonical_signature() -> None:
         signature = torch.cat((g, alpha * u, d / alpha)).abs()
         explicit.append(torch.log(torch.tensor(6.0) * signature.square().sum() / signature.abs().sum().square()))
     assert torch.allclose(scores, torch.stack(explicit).to(dtype=scores.dtype), rtol=1.0e-6, atol=1.0e-7)
+
+
+def test_participation_allocator_keeps_exact_budget_and_prefers_concentrated_experts() -> None:
+    scores = torch.tensor([
+        [10.0, 9.0, 8.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0],
+        [10.0, 9.0, 8.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+        [4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0],
+    ])
+    spectrum = participation_block_spectrum(scores, block_size=2)
+    widths = allocate_participation_widths(
+        spectrum,
+        candidate_widths=(2, 4, 6),
+        total_blocks=8,
+        block_size=2,
+    )
+
+    assert widths.tolist() == [1, 3, 1, 3]
+    assert int(widths.sum()) == 8
+
+
+def test_participation_allocator_rejects_non_aligned_or_impossible_options() -> None:
+    spectrum = torch.ones(2, 4)
+    with pytest.raises(ValueError, match="aligned"):
+        allocate_participation_widths(spectrum, candidate_widths=(1, 2), total_blocks=3, block_size=2)
+    with pytest.raises(ValueError, match="exactly representable"):
+        allocate_participation_widths(spectrum, candidate_widths=(1, 3), total_blocks=3)

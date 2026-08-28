@@ -21,12 +21,12 @@ def _rows(width: int, hidden: int, expert_id: int) -> torch.Tensor:
     return values
 
 
-def write_checkpoint(path: Path, family: str) -> dict[str, torch.Tensor]:
+def write_checkpoint(path: Path, family: str, large: bool = False) -> dict[str, torch.Tensor]:
     """Write a small safetensors fixture for one of the four supported families."""
 
     path.mkdir()
     if family == "qwen3":
-        width, hidden, experts = 128, 4, 2
+        width, hidden, experts = (768, 4, 4) if large else (128, 4, 2)
         config = {
             "model_type": "qwen3_moe", "hidden_size": hidden, "hidden_act": "silu",
             "moe_intermediate_size": width, "num_hidden_layers": 1,
@@ -39,7 +39,7 @@ def write_checkpoint(path: Path, family: str) -> dict[str, torch.Tensor]:
             tensors[f"{prefix}.up_proj.weight"] = torch.ones(width, hidden)
             tensors[f"{prefix}.down_proj.weight"] = torch.ones(hidden, width)
     elif family == "gemma4":
-        width, hidden, experts = 64, 4, 2
+        width, hidden, experts = (704, 4, 4) if large else (64, 4, 2)
         text = {
             "model_type": "gemma4_text", "hidden_size": hidden, "hidden_activation": "gelu_pytorch_tanh",
             "intermediate_size": 128, "moe_intermediate_size": width, "num_hidden_layers": 1,
@@ -57,7 +57,7 @@ def write_checkpoint(path: Path, family: str) -> dict[str, torch.Tensor]:
             "model.language_model.layers.0.pre_feedforward_layernorm_2.weight": torch.tensor([2.0, 1.0, 1.0, 1.0]),
         }
     elif family == "qwen3.6":
-        width, hidden, experts = 128, 4, 2
+        width, hidden, experts = (512, 4, 4) if large else (128, 4, 2)
         text = {
             "model_type": "qwen3_5_moe_text", "hidden_size": hidden, "hidden_act": "silu",
             "moe_intermediate_size": width, "shared_expert_intermediate_size": width,
@@ -74,7 +74,7 @@ def write_checkpoint(path: Path, family: str) -> dict[str, torch.Tensor]:
             "model.language_model.layers.0.mlp.experts.down_proj": torch.ones(experts, hidden, width),
         }
     elif family == "deepseek":
-        width, hidden, experts = 64, 4, 2
+        width, hidden, experts = (1408, 4, 4) if large else (64, 4, 2)
         config = {
             "model_type": "deepseek_v2", "hidden_size": hidden, "hidden_act": "silu",
             "moe_intermediate_size": width, "num_hidden_layers": 2, "n_routed_experts": experts,

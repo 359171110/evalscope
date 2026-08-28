@@ -169,6 +169,41 @@ python -m CSP.build_csp_artifacts \\
 statistics 或 downstream metrics。DeepSeek 的 dense 前置层和 shared experts
 不剪，导出时额外保持 fused shared expert width。
 
+HSP-Hetero 使用模型专属的、以 50% 保留宽度为中心的三档配置：
+
+$$
+\mathcal K=\{k_0-64,k_0,k_0+64\},\qquad
+(n_{k_0+64},n_{k_0},n_{k_0-64})=(E/4,E/2,E/4),
+$$
+
+其中 $k_0$ 为模型的 50% 基准宽度。对每个模型，
+$k_0+64$ 和 $k_0-64$ 两档分别分配给 $E/4$ 个 experts，
+从而保持总容量 $E\times k_0$ 不变。高分 expert 分配高档宽度，
+中间 50% 分配基准宽度，低分 expert 分配低档宽度；expert 内部的
+排序仍由 CSP score 决定。
+
+模型专属的 HSP-Hetero 宽度三档如下：
+
+| 模型 | 低档 | 基准档 | 高档 |
+| --- | ---: | ---: | ---: |
+| Qwen3 | 320 | 384 | 448 |
+| Qwen3.6 | 192 | 256 | 320 |
+| Gemma4 | 288 | 352 | 416 |
+| DeepSeek-V2-Lite | 576 | 704 | 832 |
+
+上述数值用于文档说明与离线配置记录，不需要运行 build 即可确认。
+
+HSP-Hetero 构建时可使用：
+
+```bash
+bash CSP/run_prepare.sh qwen3 "" /path/to/hsp-artifacts
+```
+
+其他模型的默认三档为：Qwen3=`320/384/448`、Qwen3.6=`192/256/320`、
+Gemma4=`288/352/416`、DeepSeek-V2-Lite=`576/704/832`；分别通过
+`CSP_HETEROGENEOUS_WIDTHS` 与 `CSP_BUDGET_WIDTH` 传入。标准 HF/vLLM 导出统一
+zero-pad 到高档物理宽度，不能据此宣称已经获得真实异构 kernel 加速。
+
 ## 7. 理论边界
 
 严格成立的性质包括：function-equivalence、minimum-energy canonical gauge、

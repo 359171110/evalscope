@@ -158,6 +158,53 @@ def canonical_structural_score_packed(
     )
 
 
+def expert_structural_score(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    down: torch.Tensor,
+) -> torch.Tensor:
+    """Compute HSP Expert-SP on the raw flattened expert parameters.
+
+    Unlike channel-level CSP, HSP Expert-SP deliberately does not apply the
+    up/down gauge canonicalization.  The score is scale invariant for a common
+    rescaling of the complete expert tensor.
+    """
+
+    if gate.ndim != 2 or up.ndim != 2 or down.ndim != 2:
+        raise ValueError("gate, up, and down must be rank-2 tensors.")
+    if gate.shape != up.shape:
+        raise ValueError("gate and up must share the same shape.")
+    channels, hidden_size = (int(size) for size in gate.shape)
+    if tuple(down.shape) != (hidden_size, channels):
+        raise ValueError("down must have shape [hidden, channels].")
+    tensors = tuple(
+        tensor.detach().to(dtype=torch.float32).reshape(1, -1)
+        for tensor in (gate, up, down)
+    )
+    if not all(bool(torch.isfinite(tensor).all()) for tensor in tensors):
+        raise ValueError("HSP expert tensors must contain only finite values.")
+    log_l1 = torch.logsumexp(torch.stack(tuple(_log_l1(tensor)[0] for tensor in tensors)), dim=0)
+    log_l2_squared = torch.logsumexp(
+        torch.stack(tuple(_log_l2_squared(tensor)[0] for tensor in tensors)), dim=0
+    )
+    signature_size = float(sum(int(tensor.numel()) for tensor in tensors))
+    return (math.log(signature_size) + log_l2_squared - 2.0 * log_l1).to(dtype=torch.float32)
+
+
+def expert_structural_score_packed(
+    gate_up: torch.Tensor,
+    down: torch.Tensor,
+) -> torch.Tensor:
+    """Compute raw HSP Expert-SP for one packed expert."""
+
+    if gate_up.ndim != 2 or down.ndim != 2 or int(gate_up.shape[0]) % 2:
+        raise ValueError("packed gate_up must be rank-2 with an even row count.")
+    width = int(gate_up.shape[0] // 2)
+    if tuple(down.shape) != (int(gate_up.shape[1]), width):
+        raise ValueError("packed gate_up and down shapes do not match.")
+    return expert_structural_score(gate_up[:width], gate_up[width:], down)
+
+
 def rank_channels_by_csp(scores: torch.Tensor) -> torch.Tensor:
     """Sort CSP scores descending with stable lower-index tie breaking."""
 
@@ -188,6 +235,96 @@ def ranking_table(scores: torch.Tensor, block_size: int) -> dict[str, torch.Tens
         "block_sizes": torch.full((width // block_size,), block_size, dtype=torch.long),
         "intermediate_size": width,
     }
+
+
+def participation_block_spectrum(scores: torch.Tensor, block_size: int) -> torch.Tensor:
+    """Return ranked normalized excess-localization mass per channel block.
+
+    CSP scores are log-domain localization values.  This maps them back to
+    ``r=exp(S)-1``, normalizes each expert independently, and sums adjacent
+    ranked channels into aligned marginal width blocks.  Degenerate experts
+    use a uniform channel spectrum as a deterministic safe fallback.
+    """
+
+    if scores.ndim != 2:
+        raise ValueError("scores must have shape [experts, channels].")
+    experts, channels = (int(size) for size in scores.shape)
+    block = int(block_size)
+    if block <= 0 or channels % block:
+        raise ValueError("channel count must be divisible by block_size.")
+    finite = torch.isfinite(scores)
+    mass = torch.where(
+        finite,
+        torch.expm1(scores.to(dtype=torch.float64)).clamp_min(0.0),
+        torch.zeros_like(scores, dtype=torch.float64),
+    )
+    totals = mass.sum(dim=1, keepdim=True)
+    fallback = torch.full_like(mass, 1.0 / channels)
+    normalized = torch.where(totals > torch.finfo(torch.float64).eps, mass / totals.clamp_min(1.0e-30), fallback)
+    ranked = torch.gather(normalized, 1, rank_channels_by_csp(scores))
+    spectrum = ranked.reshape(experts, channels // block, block).sum(dim=2)
+    if not bool(torch.isfinite(spectrum).all()):
+        raise ValueError("participation spectrum must be finite.")
+    return spectrum.to(dtype=torch.float32)
+
+
+def allocate_participation_widths(
+    block_spectrum: torch.Tensor,
+    *,
+    candidate_widths: tuple[int, ...] | list[int],
+    total_blocks: int,
+    block_size: int = 1,
+) -> torch.Tensor:
+    """Exactly maximize summed expert retention under one layer budget.
+
+    The returned values are block counts.  Dynamic programming supports any
+    aligned discrete candidate set and uses lexicographically larger width
+    tuples to break equal-utility ties, so lower expert IDs receive wider
+    choices deterministically.
+    """
+
+    if block_spectrum.ndim != 2:
+        raise ValueError("block_spectrum must have shape [experts, blocks].")
+    experts, available_blocks = (int(size) for size in block_spectrum.shape)
+    block = int(block_size)
+    widths = sorted({int(width) for width in candidate_widths})
+    if not widths:
+        raise ValueError("candidate_widths must not be empty.")
+    if block <= 0 or any(width <= 0 or width % block for width in widths):
+        raise ValueError("candidate widths must be positive and aligned to block_size.")
+    options = [width // block for width in widths]
+    if options[-1] > available_blocks:
+        raise ValueError("candidate widths exceed the available channel blocks.")
+    budget = int(total_blocks)
+    if budget <= 0:
+        raise ValueError("total_blocks must be positive.")
+
+    cumulative = torch.cat(
+        (
+            torch.zeros((experts, 1), dtype=torch.float64),
+            block_spectrum.to(dtype=torch.float64).cumsum(dim=1),
+        ),
+        dim=1,
+    )
+    states: dict[int, tuple[float, tuple[int, ...]]] = {0: (0.0, ())}
+    tolerance = 1.0e-12
+    for expert_id in range(experts):
+        next_states: dict[int, tuple[float, tuple[int, ...]]] = {}
+        for used, (utility, selected) in states.items():
+            for option in options:
+                new_used = used + option
+                if new_used > budget:
+                    continue
+                candidate = (utility + float(cumulative[expert_id, option].item()), (*selected, option))
+                previous = next_states.get(new_used)
+                if previous is None or candidate[0] > previous[0] + tolerance or (
+                    abs(candidate[0] - previous[0]) <= tolerance and candidate[1] > previous[1]
+                ):
+                    next_states[new_used] = candidate
+        states = next_states
+    if budget not in states:
+        raise ValueError("layer budget is not exactly representable by candidate widths.")
+    return torch.tensor(states[budget][1], dtype=torch.long)
 
 
 def retained_prefix(order: torch.Tensor, retained_channels: int) -> torch.Tensor:
