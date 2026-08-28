@@ -500,3 +500,19 @@ $$
 $$
 
 v1/v2 的选择是为了让不同 checkpoint 能稳定地产生可测量状态；校准集最终是否有价值，应由 expert 命中频率、conditional activation 和统计稳定性判断，而不是由文本表面质量判断。
+
+---
+
+## 11. 已完成的真实模型 pilot 验证
+
+在 A100 GPU 上使用当前实现完成了三个真实 checkpoint 的小规模验证：每个模型 2 个 256-token block，seed=42，Qwen3/Qwen3.6 使用 v1，Gemma4 使用 v2。
+
+| 模型 | mode | cache | episode-level 结果 | 结论 |
+|---|---|---|---|---|
+| Qwen3 | `user_role_continuation` | `[1,512]` | 2 个完整 episode，mechanical rejection=0 | 生成正常，包含图像模型、健康和软件工程问题 |
+| Qwen3.6 | `user_role_continuation` | `[1,512]` | 3 个完整 episode，16 条 pilot 的 rejection=25% | 通过扩大 pilot 后可生成；存在短 user turn，应记录而非按语义删除 |
+| Gemma4 | `assistant_bootstrap` | `[1,512]` | 2 个完整 episode，mechanical rejection=0 | 生成正常，包含图像分析、哲学/诗歌分析和列表回答 |
+
+Qwen3.6 的 25% pilot rejection 由 4/16 条机械 gate 失败造成；warm-up 前后比例相同，说明这不是简单的前缀随机性问题。它不应被解释为语义分布错误，也不应通过删除澄清或短回答来“修复”。正式生成应保存 rejection diagnostics，并在结果中报告有效 episode 数、user/assistant 长度和 termination 状态。
+
+pilot 输出位于同目录的 `pilot_outputs/`（该目录为本地验证产物，不属于方法代码）。对应 inspection 必须同时查看 `quality.user`、`quality.assistant`、`quality.episode` 和 `semantic_modes`；本次三个模型均未出现 block-level 或 episode-level 的极端机械循环。

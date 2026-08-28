@@ -40,8 +40,8 @@ for i in 0 1 2; do
     --output "$OUTPUT_DIR/${NAMES[$i]}_cn_moe_sc_pilot.pt"
     --blocks 2
     --block-length 256
-    --pilot-episodes 4
-    --max-attempts 64
+    --pilot-episodes 16
+    --max-attempts 128
     --episode-batch-size 4
     --max-user-tokens 64
     --max-assistant-tokens 128

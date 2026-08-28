@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
+import shutil
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -594,6 +596,7 @@ def _build_payload(
     warmup_temperature: float,
     warmup_tokens: int,
     user_generation_mode: str,
+    rejection_diagnostics: list[dict[str, Any]],
 ) -> dict[str, Any]:
     """Create an auditable shared calibration payload."""
 
@@ -665,6 +668,13 @@ def _build_payload(
             "naturally_terminated_assistant_turns": terminated_assistants,
             "user_termination_rate": terminated_users / max(len(episodes), 1),
             "assistant_termination_rate": terminated_assistants / max(len(episodes), 1),
+            "mean_episode_tokens": sum(len(episode.token_ids) for episode in episodes) / max(len(episodes), 1),
+            "median_episode_tokens": sorted(len(episode.token_ids) for episode in episodes)[len(episodes) // 2]
+            if episodes
+            else 0,
+            "mean_user_tokens": sum(episode.user_tokens for episode in episodes) / max(len(episodes), 1),
+            "mean_assistant_tokens": sum(episode.assistant_tokens for episode in episodes)
+            / max(len(episodes), 1),
             "native_scaffold": {
                 "user_prefix_tokens": len(scaffold.user_prefix),
                 "user_bridge_tokens": len(scaffold.user_bridge),
@@ -673,6 +683,7 @@ def _build_payload(
                 "assistant_stop_token_id": scaffold.assistant_stop_token_id,
             },
         },
+        "rejection_diagnostics": rejection_diagnostics,
     }
 
 
@@ -695,6 +706,12 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
 
     from transformers import AutoTokenizer
     from vllm import LLM, SamplingParams
+
+    environment_bin = str(Path(sys.executable).resolve().parent)
+    path_parts = os.environ.get("PATH", "").split(os.pathsep)
+    if environment_bin not in path_parts:
+        os.environ["PATH"] = os.pathsep.join((environment_bin, *path_parts))
+    print(f"runtime_python={sys.executable} runtime_ninja={shutil.which('ninja')}", flush=True)
 
     model_path = args.model_path.expanduser().resolve()
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -733,6 +750,11 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
         tokenizer=tokenizer,
     )
     pilot_valid = [_is_valid_episode(episode, tokenizer)[0] for episode in pilot]
+    rejection_diagnostics: list[dict[str, Any]] = []
+    for index, (episode, valid) in enumerate(zip(pilot, pilot_valid)):
+        if not valid:
+            _, metrics = _is_valid_episode(episode, tokenizer)
+            rejection_diagnostics.append({"stage": "pilot", "index": index, "seed": episode.seed, "metrics": metrics})
     pilot_rejection_rate = sum(not valid for valid in pilot_valid) / max(len(pilot_valid), 1)
     print(
         f"pilot accepted={sum(pilot_valid)}/{len(pilot_valid)} "
@@ -759,6 +781,12 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
             warmup_tokens=args.warmup_tokens,
         )
         warmup_valid = [_is_valid_episode(episode, tokenizer)[0] for episode in warmup_pilot]
+        for index, (episode, valid) in enumerate(zip(warmup_pilot, warmup_valid)):
+            if not valid:
+                _, metrics = _is_valid_episode(episode, tokenizer)
+                rejection_diagnostics.append(
+                    {"stage": "warmup_pilot", "index": index, "seed": episode.seed, "metrics": metrics}
+                )
         warmup_rejection_rate = sum(not valid for valid in warmup_valid) / max(len(warmup_valid), 1)
         print(
             f"warmup_pilot accepted={sum(warmup_valid)}/{len(warmup_valid)} "
@@ -796,13 +824,21 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
         )
         seed_cursor += request_count
         attempted += request_count
-        for episode in generated:
+        for generated_index, episode in enumerate(generated):
             valid, metrics = _is_valid_episode(episode, tokenizer)
             if valid:
                 accepted.append(episode)
                 accepted_tokens += len(episode.token_ids)
             else:
                 rejected += 1
+                rejection_diagnostics.append(
+                    {
+                        "stage": "formal",
+                        "index": attempted - request_count + generated_index,
+                        "seed": episode.seed,
+                        "metrics": metrics,
+                    }
+                )
             if len(accepted) <= 3 or len(accepted) % 16 == 0:
                 print(
                     f"episode accepted={len(accepted)} tokens={accepted_tokens}/{target_tokens} "
@@ -837,6 +873,7 @@ def build_calibration(args: argparse.Namespace) -> dict[str, Any]:
         warmup_temperature=args.warmup_temperature,
         warmup_tokens=args.warmup_tokens,
         user_generation_mode=args.user_generation_mode,
+        rejection_diagnostics=rejection_diagnostics,
     )
     payload["calibration_pools"] = {
         "natural_discovery": {
