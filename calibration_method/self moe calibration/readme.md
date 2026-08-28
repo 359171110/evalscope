@@ -1,1614 +1,502 @@
-可以。解决你这次复现暴露出的生成退化问题以后，我建议把原来的 Self-Calibration 改造成一套更适合现代 MoE instruction checkpoints 的：
+# Checkpoint-Native MoE Self-Calibration
+
+## 1. 方法定位
+
+本目录实现的是 **Checkpoint-Native MoE Self-Calibration（CN-MoE-SC）** 的生成与检查部分。
+
+它的目标不是生成主题均衡、语言均衡或“看起来高质量”的文本，而是从待分析 checkpoint 自身产生 token，并测量这些 token 在模型中的 MoE 行为：
+
+1. 每一层每个 expert 的命中频率；
+2. router 对各 expert 的 routing mass；
+3. expert 被命中之后，各 channel 的条件激活强度；
+4. channel activation 的稳定性、相关性和潜在冗余。
+
+目标统计可以写成：
 
 $$
-\boxed{\textbf{Checkpoint-Native MoE Self-Calibration (CN-MoE-SC)}}
+P(e_i\mid x),
+\qquad
+E[a_{i,c}^{2}\mid e_i\text{ is hit}],
+\qquad
+E[a_i a_i^{\mathsf T}\mid e_i\text{ is hit}].
 $$
 
-核心思想不再是机械地：
+这些统计服务于后续的 expert 重要性判断、channel selection、width allocation 和冗余分析。文本是否像一篇完整文章不是本方法的主要评价标准。
+
+本方法仍然是 **external-data-free**：不引入 WikiText、benchmark 样本或人工主题语料；只使用 checkpoint 自带的 tokenizer、chat template 和 control tokens。它不是 calibration-free，而是 calibration data 由模型自身生成。
+
+---
+
+## 2. 当前实现状态
+
+| 能力 | 当前状态 |
+|---|---|
+| 从 checkpoint 的 native chat template 构造 scaffold | 已实现 |
+| v1 `user_role_continuation` | 已实现 |
+| v2 `assistant_bootstrap` | 已实现 |
+| `temperature=1`、`top_p=1` 的最小采样 | 已实现 |
+| `ignore_eos=False`、`min_tokens=0` | 已实现 |
+| 独立 episode 生成 | 已实现 |
+| 机械退化 gate | 已实现 |
+| user 在 assistant 之前的独立 gate | 已实现 |
+| clarification/refusal/list/fixed-format 诊断 | 已实现为启发式统计 |
+| 固定长度 cache packing | 已实现 |
+| episode/block boundary provenance | 已实现 |
+| 现有 Wanda/ENP loader 兼容的 `[1, N]` cache | 已实现 |
+| episode-aware MoE collector | **本目录未实现** |
+| Natural Discovery / Coverage Reserve 的实际统计隔离 | **目前只有 metadata** |
+| split-half expert/channel stability | **未实现** |
+| High/Medium/Low confidence mask | **未实现** |
+| router-guided conditional fallback | **未实现** |
+
+最重要的限制是：当前 cache 虽然记录了 episode boundary，但现有 Wanda/ENP collector 仍按固定长度 block forward。只有 collector 读取 boundary 并逐 episode forward，才能完全满足 independent-episode 的统计语义。
+
+---
+
+## 3. 之前遇到的问题
+
+### 3.1 BOS-only 固定长度生成退化
+
+旧方法采用：
 
 $$
 \text{BOS}\rightarrow2048\text{ tokens},
 $$
 
-而是：
+并设置 `ignore_eos=True`、`min_tokens=2047`。这会让模型无法自然结束。模型完成一个短回答或进入文本边界后，只能继续生成，容易掉入重复吸引子。
+
+典型现象包括：
+
+* 单字符或单词重复；
+* 短片段循环；
+* 标点和模板符号循环；
+* 多语言碎片循环；
+* 生成内容与正常 instruction operating format 不一致。
+
+Qwen3 在 BOS-only continuation 下相对稳定，能生成代码、技术文档和教程；Qwen3.6、Gemma4 更容易退化。因此不能把“128 条 token 行互不相同”当成 calibration quality 的证据。
+
+### 3.2 user 内容退化被 assistant 掩盖
+
+早期实现将 user 和 assistant 合并后再做质量判断：
 
 $$
-\boxed{
-\text{从 checkpoint 自己的原生交互分布生成有效状态，
-自然终止，以固定 token budget 收集 MoE expert-conditioned statistics，
-并把 coverage 不足转化成“不确定性”而不是强行补齐。}
-}
+\text{bad user}+\text{normal assistant}
+\longrightarrow
+\text{apparently normal episode}.
 $$
 
-整个 Self-Calibration 阶段只负责为后面的：
+Gemma4 曾出现 `ትን-ትን-ትን`、`implementation-implementation`、`de-spa-el` 等 user 碎片，而 assistant 将其解释为键盘故障、音译或歌词。assistant 100% 自然结束并不能证明 user 正常。
+
+### 3.3 2048 packing 掩盖坏 episode
+
+固定长度 block 是 cache 和旧 loader 的存储兼容格式，不是语义上的上下文边界。短 episode 被大量打包后，坏 episode 的局部指标会被其他内容冲淡：
 
 $$
-\text{Selection}
-\rightarrow
-\text{Width Allocation}
-\rightarrow
-\text{Compensation}
+\text{episode-level failure}
+\not\Rightarrow
+\text{block-level failure}.
 $$
 
-提供可靠统计。
+所以必须同时检查 block、episode、user 和 assistant 四个粒度。
 
----
+### 3.4 v2 的语义模式集中
 
-# 1. 总体定义
+assistant bootstrap 能改善 Gemma4 的机械碎片问题，但 Qwen3 在空 assistant channel 后容易生成：
 
-我们不使用任何外部 calibration corpus：
+> It seems like your message might be incomplete. Could you please clarify…
 
-$$
-\boxed{\mathcal D_{\rm external}=\varnothing}.
-$$
+这类文本语法正确、重复率正常、能够自然结束，因此会通过机械 gate；但如果绝大多数 episode 都是澄清套话，测量分布就会发生 mode concentration。它不是机械生成失败，也不应被静默删除，必须作为 semantic-mode concentration 报告。
 
-所有 lexical content 都由待剪枝模型 \(M_\theta\) 自己生成。
+### 3.5 过度语义过滤会引入 selection bias
 
-但我们允许使用 checkpoint 自带的：
-
-* tokenizer；
-* BOS/EOS；
-* chat template；
-* role token；
-* turn delimiter；
-* channel/control token。
-
-这些属于模型自身 metadata，而不是外部语义 calibration data。
-
-因此方法仍然属于：
+澄清、拒答、列表、固定格式、多语言和短回答都是真实模型行为。删除它们会改变：
 
 $$
-\boxed{\text{external-data-free}}
+\hat P(e_i)=P(e_i\mid x\text{ passes a semantic filter}),
 $$
 
-但不是 calibration-free。
-
----
-
-# 2. 第一项修改：Checkpoint-Native Generation Mode
-
-不再规定所有模型统一 BOS-only。
-
-首先根据 checkpoint 类型选择原生生成模式。
+而不是想要测量的模型原生协议分布。因此语义模式只做诊断，不能作为默认 hard rejection 条件。
 
 ---
 
-## 2.1 Base / continuation checkpoint
+## 4. v1/v2：最低限度工程适配
 
-如果模型本身是 base LM，则保持原 Self-Calibration：
+v1/v2 不是两种预设的语义数据集，也不是“哪个文本更好”的比较。它们是根据 checkpoint 的训练格式、指令遵循特征和 native control structure，为了让模型稳定地产生可观测 token 流而选择的两个工程入口。
 
-$$
-\boxed{
-BOS
-\rightarrow
-x_1,\ldots,x_T
-}
-$$
+统一的是：
 
-其中：
+* MoE 测量目标；
+* token 统计口径；
+* mechanical health 检查；
+* provenance 和稳定性报告。
 
-$$
-x_t\sim p_\theta(x_t|x_{<t}).
-$$
+不强行统一的是每个模型的 generation entry point。
 
-允许模型正常 EOS。
+### 4.1 v1：`user_role_continuation`
 
----
-
-## 2.2 Instruction / Chat checkpoint
-
-对于目前的：
-
-* Qwen3-Instruct；
-* Qwen3.6；
-* Gemma4-it；
-
-统一采用：
-
-$$
-\boxed{\textbf{Native-Template Self-Dialogue}}
-$$
-
-而不是裸 BOS。
-
-一段 calibration episode：
-
-$$
-e=
-[\mathcal S_U,\;u,\;\mathcal E_U,\;
- \mathcal S_A,\;a,\;\mathcal E_A].
-$$
-
-其中：
-
-* \(\mathcal S_U\)：checkpoint 原生 user-role prefix；
-* \(\mathcal E_U\)：原生 user-turn terminator；
-* \(\mathcal S_A\)：原生 assistant-role prefix；
-* \(\mathcal E_A\)：原生 assistant terminator。
-
-这些全部从 tokenizer/chat template 获取，**不手写 token ID**。
-
----
-
-# 3. Self-Generated User Turn
-
-这里不能人工写：
-
-> Solve a math problem.
-
-也不能写：
-
-> Tell me something.
-
-否则又引入：
-
-$$
-P(x|\text{human prompt}).
-$$
-
-我们直接在 native user scaffold 后让模型自己生成 user content：
-
-$$
-u_t
-\sim
-p_\theta
-\left(
-u_t
-\mid
-\mathcal S_U,u_{<t}
-\right).
-$$
-
-直到：
-
-$$
-\mathcal E_U
-$$
-
-或 episode 上限。
-
-于是：
-
-$$
-\boxed{
-u\text{ 也是模型自己产生的}
-}
-$$
-
-没有任何外部 task semantics。
-
-这利用的是模型 instruction tuning 时已经学到的：
-
-$$
-P(\text{user content}\mid\text{user role prefix}).
-$$
-
----
-
-# 4. Self-Generated Assistant Turn
-
-得到自生成 user turn 后，加入 checkpoint 原生：
-
-$$
-\mathcal S_A.
-$$
-
-再采样：
-
-$$
-a_t
-\sim
-p_\theta
-\left(
-a_t
-\mid
-\mathcal S_U,u,\mathcal E_U,\mathcal S_A,a_{<t}
-\right).
-$$
-
-直到：
-
-$$
-\mathcal E_A
-$$
-
-或 episode 上限。
-
-因此整个 episode：
-
-$$
-\boxed{
-\text{structural scaffold来自checkpoint，
-所有语义内容来自模型自己}
-}
-$$
-
-这比 BOS-only 更适合 instruction checkpoints，又没有引入人工 prompt。
-
----
-
-# 5. 三个模型的实现原则
-
-## Qwen3 / Qwen3.6
-
-由 tokenizer 自己产生：
-
-$$
-\texttt{<|im\_start|>user}
-$$
-
-等 native role/turn boundaries。
-
-不要再手工：
-
-$$
-\texttt{<|endoftext|>}
-$$
-
-作为唯一启动或终止依据。
-
-尤其 Qwen3.6 中不同 EOS/turn terminator 口径必须由 native template 处理。
-
----
-
-## Gemma4
-
-同样直接使用 tokenizer/checkpoint 定义的：
-
-* BOS；
-* user turn；
-* assistant turn；
-* channel；
-* role；
-* end-of-turn
-
-等控制结构。
-
-不允许：
-
-$$
-\boxed{\text{裸 <bos> 后直接 lexical sampling}}
-$$
-
-作为默认 calibration protocol。
-
-这样可以避免你现在观测到的：
-
-$$
-45/128
-$$
-
-首 token 落入同一个韩语片段这种异常初始 mode concentration。
-
----
-
-# 6. 第二项修改：Natural Termination
-
-这个必须严格修改。
-
-所有生成：
-
-$$
-\boxed{
-\texttt{ignore\_eos=False}
-}
-$$
-
-并且：
-
-$$
-\boxed{
-\texttt{min\_tokens=0}.
-}
-$$
-
-绝不能再：
-
-$$
-\texttt{min\_tokens}=2047
-$$
-
-强迫模型生成。
-
-如果模型在：
-
-$$
-T=173
-$$
-
-时认为一个 turn/episode 已自然结束，那么：
-
-$$
-\boxed{\text{就在 173 结束}}
-$$
-
-而不是继续采到 2048。
-
----
-
-# 7. 不再要求“一条 sequence 必须连续 2048 tokens”
-
-这是一个非常重要的修改。
-
-我们的目标仍然保持标准 calibration budget：
-
-$$
-\boxed{
-128\times2048
-=
-262144
-}
-$$
-
-个 model tokens。
-
-但是这里的 \(128\times2048\) 定义为：
-
-$$
-\boxed{\textbf{token-equivalent calibration budget}}
-$$
-
-而不是：
-
-> 128 次必须连续生成满 2048 token。
-
----
-
-## Calibration Block
-
-定义 calibration block：
-
-$$
-B_j
-$$
-
-目标 token 数：
-
-$$
-|B_j|=2048.
-$$
-
-它可以包含多个独立 episode：
-
-$$
-B_j=
-\{e_1,e_2,\ldots,e_m\}
-$$
-
-满足：
-
-$$
-\sum_{k=1}^{m}|e_k|
-\approx2048.
-$$
-
-但是每个：
-
-$$
-e_k
-$$
-
-**独立 forward**，attention state 不跨 episode 延续。
-
-这样如果模型自然只生成：
-
-$$
-300
-$$
-
-tokens：
-
-> 结束 → 重启一个新的 native episode。
-
-而不是：
-
-> 强迫原 episode 再吐 1700 个 token。
-
----
-
-# 8. 为什么 independent episodes 更适合我们的 MoE pruning
-
-后面我们需要的是：
-
-$$
-E[a_ca_q],
-$$
-
-$$
-P(h_l^E|E_i),
-$$
-
-$$
-D_i(d),
-$$
-
-这些 activation statistics。
-
-它们不要求所有 262k token 位于连续的 2048-context 中。
-
-所以：
-
-$$
-\boxed{
-\text{多个真实有效 episode}
->
-\text{一段被强制拖到2048的退化文本}
-}
-$$
-
-对于 calibration statistics 更合理。
-
-同时仍然维持完全相同的：
-
-$$
-262144
-$$
-
-token budget。
-
----
-
-# 9. 第三项修改：Sampling Protocol
-
-默认严格使用最少干预的 sampling：
-
-$$
-\boxed{
-T=1
-}
-$$
-
-$$
-\boxed{
-top_p=1
-}
-$$
-
-$$
-\boxed{
-top_k=\varnothing
-}
-$$
-
-$$
-\boxed{
-repetition\_penalty=1
-}
-$$
-
-不默认使用：
-
-* repetition penalty；
-* frequency penalty；
-* presence penalty；
-* no-repeat ngram；
-* beam search。
-
-因为这些都会主动改变：
-
-$$
-p_\theta(x).
-$$
-
-所以默认目标仍然尽量接近：
-
-$$
-\boxed{x\sim p_\theta}.
-$$
-
----
-
-# 10. Prefix-collapse fallback
-
-但是你已经证明 Qwen3.6/Gemma4 可能出现：
-
-$$
-\text{从第一批 lexical tokens 就进入极低熵 mode}.
-$$
-
-因此在正式生成前先运行：
-
-$$
-\boxed{16\text{-episode pilot}}
-$$
-
-检查 prefix collapse。
-
-如果 native-template 以后仍然出现明显：
-
-* first-token concentration；
-* prefix diversity collapse；
-* catastrophic loop；
-
-则允许使用原 Self-Cal 已经讨论过的 **temperature warm-up**：
-
-$$
-T_t
-=
-T_0-
-\frac{t}{m}(T_0-1),
-\qquad t\le m,
-$$
-
-之后：
-
-$$
-T_t=1.
-$$
-
-例如默认候选：
-
-$$
-T_0=1.5,\qquad m=8.
-$$
-
-即：
-
-$$
-\boxed{
-\text{前8个 lexical tokens 稍微提高探索，
-随后恢复 }T=1.
-}
-$$
-
-注意这只是：
-
-$$
-\boxed{\text{generation-health fallback}}
-$$
-
-而不是所有模型强制使用。
-
-Qwen3 如果：
-
-$$
-T=1
-$$
-
-已经健康，就完全不启用。
-
----
-
-# 11. 不使用 English-stopword 强约束作为默认方案
-
-原 Self-Calibration 对一些模型做过 first-token English constraint。
-
-我们这里不作为默认方法。
-
-因为最终 benchmark 包含：
-
-* code；
-* math；
-* reasoning；
-* natural language。
-
-如果把第一 token 限定为英语 stopword，会人为削弱其他模式。
-
-所以优先级是：
-
-$$
-\boxed{
-\text{Native Template}
->
-\text{Natural EOS}
->
-\text{temperature warm-up}
-}
-$$
-
-而不是 lexical allowlist。
-
----
-
-# 12. 第四项修改：Generation Validity Gate
-
-我们不能再接受：
-
-$$
-\text{token序列不同}
-\Rightarrow
-\text{有效 calibration}.
-$$
-
-每个 episode 生成后计算 mechanical-degeneration diagnostics。
-
----
-
-## 12.1 Distinct-token ratio
-
-$$
-r_{\rm distinct}
-=
-\frac{
-|\operatorname{UniqueTokens}(e)|
-}{
-|e|
-}.
-$$
-
----
-
-## 12.2 Dominant-token ratio
-
-$$
-r_{\rm dom}
-=
-\max_t
-\frac{
-\operatorname{count}(t)
-}{
-|e|
-}.
-$$
-
----
-
-## 12.3 Repeated n-gram ratio
-
-例如：
-
-$$
-r_{4g}
-$$
-
-统计重复 4-gram / 8-gram 所覆盖的 token 比例。
-
----
-
-## 12.4 Periodic-loop detection
-
-检测类似：
-
-```text
-dddddddd...
-```
-
-```text
-不可使用 不可使用 不可使用...
-```
-
-以及固定长度：
-
-$$
-k
-$$
-
-的周期循环。
-
----
-
-# 13. 只过滤 catastrophic degeneration
-
-Validity Gate **不能做 semantic quality filtering**。
-
-不能因为：
-
-* 两段都在讲代码；
-* 两段语言类似；
-* 两段主题相似；
-
-就删除。
-
-否则：
-
-$$
-P_{\rm calibration}
-$$
-
-又被人为改掉。
-
-只拒绝明显：
-
-$$
-\boxed{\text{mechanical generation failure}}
-$$
-
-例如默认可以把：
-
-$$
-r_{\rm dom}>0.5
-$$
-
-或者：
-
-$$
-r_{\rm distinct}<0.02
-$$
-
-或者极端 n-gram loop
-
-作为 invalid。
-
-这些阈值需要做小规模 sensitivity check，而不是作为理论常数。
-
----
-
-# 14. Invalid episode 怎么处理
-
-如果某个 episode 触发 degeneration gate：
-
-$$
-e_j\rightarrow\text{invalid}.
-$$
-
-立即结束当前 episode 并重新开启一个 independent native episode。
-
-invalid token：
-
-$$
-\boxed{\text{不计入262144 token calibration budget}}
-$$
-
-但必须记录：
-
-$$
-\boxed{\text{rejection rate}}
-$$
-
-作为 generation health metric。
-
----
-
-# 15. 不能无限重采样
-
-如果某 checkpoint 在 pilot/正式生成中：
-
-$$
-R_{\rm invalid}>\tau_{\rm health}
-$$
-
-例如：
-
-$$
-10\%-20\%
-$$
-
-量级，
-
-就不能靠不断 rejection 来“洗”出漂亮数据。
-
-应该判定：
-
-$$
-\boxed{
-\text{当前 generation protocol 对该 checkpoint 不健康}
-}
-$$
-
-然后：
-
-1. BOS-only → Native Template；
-2. Native Template → Prefix Temperature Warm-up；
-3. 仍失败 → 该 checkpoint 的 Self-Cal confidence 降级。
-
-而不是无限 retry。
-
----
-
-# 16. 第五项修改：Calibration Pool 不再用“unique sequence count”判断质量
-
-生成结束后，我们记录：
-
-$$
-\boxed{
-\mathcal D_{\rm SC}
-}
-$$
-
-的整体 health profile：
-
-* valid token count；
-* episode count；
-* natural termination ratio；
-* mean/median episode length；
-* distinct-token ratio；
-* dominant-token ratio；
-* n-gram diversity；
-* invalid/retry rate；
-* first-token entropy。
-
-因此不再用：
-
-$$
-\texttt{unique\_sequences}=128
-$$
-
-这种没有意义的指标代表 diversity。
-
----
-
-# 17. 第六项修改：MoE-Conditioned Statistics
-
-完成有效生成以后，才进入 MoE-specific calibration。
-
-对于每个 token，在每个 MoE layer 捕获：
-
-$$
-x_l^R
-$$
-
-和：
-
-$$
-x_l^E.
-$$
-
-其中：
-
-* \(x_l^R\)：真实 router input；
-* \(x_l^E\)：真实 routed-expert input。
-
----
-
-## Qwen3/Qwen3.6
-
-通常：
-
-$$
-x_l^R=x_l^E.
-$$
-
----
-
-## Gemma4
-
-必须：
-
-$$
-\boxed{
-x_l^R\neq x_l^E
-}
-$$
-
-分别按模型 native forward hook。
-
-所有 expert channel statistics 只使用：
-
-$$
-x_l^E.
-$$
-
----
-
-# 18. 128×2048 内部分成 Natural Discovery + Coverage Reserve
-
-为了避免你之前指出的 circular bias，我建议总 budget：
-
-$$
-128\times2048
-$$
-
-内部这样分：
-
-$$
-\boxed{
-96\times2048
-\quad
-\mathcal D_N
-}
-$$
-
-和：
-
-$$
-\boxed{
-32\times2048
-\quad
-\mathcal D_R
-}
-$$
-
-但两者**全部采用相同的 checkpoint-native natural generation**。
-
-这里不再默认做 router-guided generation。
-
----
-
-# 19. Natural Discovery Set
-
-前：
-
-$$
-96\times2048
-$$
-
-只负责估计模型自己的自然 routing statistics。
-
-例如：
-
-$$
-p_{l,i}^{N}
-=
-P_{\mathcal D_N}
-(i\in TopK)
-$$
-
-以及 expert-conditioned hit pool：
-
-$$
-\mathcal H_{l,i}^{N}.
-$$
-
-一旦计算：
-
-$$
-p_{l,i}^{N},
-$$
-
-之后永久冻结。
-
----
-
-# 20. Coverage Reserve
-
-剩下：
-
-$$
-32\times2048
-$$
-
-仍然只是：
-
-$$
-x\sim p_\theta
-$$
-
-自然生成。
-
-它的作用不是重新估计：
-
-$$
-P(E_i).
-$$
-
-而只是给低样本 expert 增加：
-
-$$
-P(h_l^E|E_i)
-$$
-
-的条件样本。
-
-因此：
-
-$$
-\boxed{
-\mathcal D_R
-\text{ 不参与 expert natural prevalence estimation}
-}
-$$
-
-避免：
-
-> 为了补 coverage → 又把某 expert 判得更重要。
-
----
-
-# 21. Gemma4 不要求强制覆盖全部 expert
-
-这是这版最重要的修改之一。
-
-以前：
-
-$$
-n_{l,i}<32
-\rightarrow
-\text{guided补到32}.
-$$
-
-现在取消。
-
-对于：
-
-$$
-n_{l,i}
-=
-|\mathcal H^N_{l,i}\cup\mathcal H^R_{l,i}|,
-$$
-
-coverage 只用于估计：
-
-$$
-\boxed{\text{confidence}}
-$$
-
-而不是硬性要求。
-
----
-
-# 22. Split-Half Stability
-
-而且不能再简单：
-
-$$
-n_i\ge32
-\Rightarrow\text{safe}.
-$$
-
-把 Natural pool 分成：
-
-$$
-\mathcal D_N^A,\qquad
-\mathcal D_N^B.
-$$
-
-对 expert \(i\) 分别估计 channel statistics，比如：
-
-$$
-m_{i,c}^{A}
-=
-E_A[a_c^2],
-$$
-
-$$
-m_{i,c}^{B}
-=
-E_B[a_c^2].
-$$
-
-计算：
-
-$$
-\rho_i
-=
-Spearman(m_i^A,m_i^B)
-$$
-
-以及 provisional retained overlap：
-
-$$
-O_i^{50}.
-$$
-
-所以 expert 的可靠性由：
-
-$$
-\boxed{
-\text{coverage}
-+
-\text{statistical stability}
-}
-$$
-
-共同决定。
-
----
-
-# 23. Confidence 分级
-
-例如：
-
-### High-confidence
-
-样本充分，而且：
-
-$$
-\rho_i
-$$
-
-和 retained-set overlap 足够稳定。
-
-允许后续：
-
-* full covariance；
-* set-aware selection；
-* heterogeneous width；
-* joint compensation。
-
----
-
-### Medium-confidence
-
-有一定样本，但统计不够稳定。
-
-后续：
-
-* covariance shrinkage；
-* width 保持接近 uniform；
-* bounded compensation。
-
----
-
-### Low-confidence
-
-几乎没有自然 samples，或者 A/B 极不稳定。
-
-后续：
-
-$$
-\boxed{
-d_i=d_0
-}
-$$
-
-保持 uniform baseline；
-
-不参与 heterogeneity；
-
-不做 aggressive compensation。
-
----
-
-# 24. 这就是解决 Gemma4 coverage 问题的核心
-
-Gemma4 如果仍然有：
-
-$$
-n_i\approx0
-$$
-
-我们**不再强迫模型人为生成这些 expert 的数据**。
-
-而是：
-
-$$
-\boxed{
-\text{无法可靠 self-calibrate}
-\Rightarrow
-\text{不允许对该 expert 做高风险决策}.
-}
-$$
-
-所以方法不会因为：
-
-$$
-\text{Gemma4 natural routing skew}
-$$
-
-而失效。
-
-它只会自动变得更保守。
-
----
-
-# 25. Router-Guided generation 降级为可选 fallback
-
-我们之前：
-
-$$
-W_R
-\rightarrow
-\text{vocabulary token}
-\rightarrow
-\text{guided generation}
-$$
-
-的想法不完全删除。
-
-但是从核心 Self-Cal protocol 中拿掉。
-
-只有当：
-
-$$
-n_i=0
-$$
-
-导致连最低 activation statistic 都无法获得时，才允许作为 optional fallback。
-
-而且 router-guided samples：
-
-$$
-\boxed{
-\text{只能用于 conditional statistics}
-}
-$$
-
-不能用于：
-
-$$
-P(E_i)
-$$
-
-不能直接让 expert 获得 high-confidence 状态。
-
-并且默认只能支持：
-
-* diagonal activation estimate；
-* conservative baseline selection。
-
-不能仅因为 guided samples 多，就允许 aggressive heterogeneity。
-
----
-
-# 26. 为什么这版方法理论上更干净
-
-我们的最终数据角色非常明确：
-
-$$
-\boxed{
-\mathcal D_N
-\rightarrow
-P_\theta(E_i)
-+
-P_\theta(h|E_i)
-}
-$$
-
-$$
-\boxed{
-\mathcal D_R
-\rightarrow
-\text{additional natural samples of }P_\theta(h|E_i)
-}
-$$
-
-而 optional guided：
-
-$$
-\boxed{
-\mathcal D_G
-\rightarrow
-\text{biased conditional fallback only}
-}
-$$
-
-它们不会混在一起重新统计 prevalence。
-
----
-
-# 27. 最终生成算法
-
-可以概括为：
-
-$$
-\boxed{
-\begin{array}{l}
-\textbf{Input: } M_\theta,\ tokenizer,\ B=128\times2048 \\[2mm]
-
-1.\ \text{Detect checkpoint type} \\
-\quad\text{base}\rightarrow\text{BOS continuation}\\
-\quad\text{instruct}\rightarrow\text{native-template self-dialog}\\[2mm]
-
-2.\ \text{Run 16-episode health pilot} \\[1mm]
-
-3.\ \text{Use }T=1,\ top_p=1,\ ignore\_eos=False \\[1mm]
-
-4.\ \text{Generate independent naturally terminated episodes} \\[1mm]
-
-5.\ \text{Reject only catastrophic mechanical degeneration} \\[1mm]
-
-6.\ \text{If prefix collapse persists, enable short temperature warm-up} \\[1mm]
-
-7.\ \text{Accumulate }262144\text{ valid model tokens} \\[1mm]
-
-8.\ \text{First }96\times2048\rightarrow\mathcal D_N \\[1mm]
-
-9.\ \text{Remaining }32\times2048\rightarrow\mathcal D_R \\[1mm]
-
-10.\ \text{Collect native router/expert states} \\[1mm]
-
-11.\ \text{Estimate per-expert coverage + split-half stability} \\[1mm]
-
-12.\ \text{Assign High/Medium/Low confidence} \\[1mm]
-
-13.\ \text{Return calibration statistics + confidence masks.}
-\end{array}
-}
-$$
-
----
-
-# 28. Qwen3 / Qwen3.6 / Gemma4 的最终统一策略
-
-| 项目                    | Qwen3                | Qwen3.6              | Gemma4               |
-| --------------------- | -------------------- | -------------------- | -------------------- |
-| checkpoint 类型         | instruct             | instruct             | instruct             |
-| 默认启动                  | native chat scaffold | native chat scaffold | native chat scaffold |
-| 手写 BOS-only           | 否                    | 否                    | 否                    |
-| lexical prompt        | **无**                | **无**                | **无**                |
-| user 内容               | self-generated       | self-generated       | self-generated       |
-| assistant 内容          | self-generated       | self-generated       | self-generated       |
-| EOS                   | native               | native               | native               |
-| `ignore_eos`          | False                | False                | False                |
-| `min_tokens`          | 0                    | 0                    | 0                    |
-| default T             | 1                    | 1                    | 1                    |
-| default top-p         | 1                    | 1                    | 1                    |
-| repetition penalty    | 1                    | 1                    | 1                    |
-| 2048 强制续写             | **否**                | **否**                | **否**                |
-| episode reset         | ✓                    | ✓                    | ✓                    |
-| degeneration gate     | ✓                    | ✓                    | ✓                    |
-| expert必须全覆盖           | **否**                | **否**                | **否**                |
-| low-confidence expert | 保守                   | 保守                   | 保守                   |
-
----
-
-# 29. 这版 Self-Calibration 输出什么
-
-CN-MoE-SC 最终不是简单输出一个：
-
-$$
-\texttt{calibration.pt}.
-$$
-
-它应该输出四类统计。
-
-### Generation statistics
-
-$$
-\mathcal S_{\rm gen}
-$$
-
-包括：
-
-* valid token count；
-* episode length；
-* EOS rate；
-* degeneration rate；
-* diversity statistics。
-
-### Natural routing statistics
-
-$$
-\mathcal S_{\rm route}
-$$
-
-包括：
-
-$$
-p_{l,i}^{N}
-$$
-
-和实际 router coefficients。
-
-### Expert-conditioned state statistics
-
-$$
-\mathcal H_{l,i}.
-$$
-
-### Confidence metadata
-
-$$
-\boxed{
-c_{l,i}\in
-\{\text{High},\text{Medium},\text{Low}\}
-}
-$$
-
-后续所有 pruning 模块必须尊重这个 confidence mask。
-
----
-
-# 30. 然后和我们最新整套 pruning 方法对接
-
-最终：
-
-$$
-\boxed{
-\text{CN-MoE-SC}
-}
-$$
-
-提供：
-
-$$
-A_i,\quad
-G_i=E[a_ia_i^\top],\quad
-\text{confidence}_i.
-$$
-
-再进入：
-
-$$
-\boxed{
-\text{Set-aware Functional Selection}
-}
-$$
-
-其中：
-
-$$
-Q_i
-=
-E[a_ia_i^\top]
-\odot
-W_{d,i}^{\top}W_{d,i}.
-$$
-
-然后：
-
-$$
-\boxed{
-\text{Conservative Width Redistribution}
-}
-$$
-
-只有 high-confidence expert 才允许明显偏离 uniform baseline。
-
-最后：
-
-$$
-\boxed{
-\text{Bounded Joint Output Compensation}.
-}
-$$
-
----
-
-## 这版方法最核心的变化可以浓缩成一句话
-
-原 Self-Cal 是：
-
-$$
-\boxed{
-\text{BOS}\rightarrow
-\text{fixed-length synthetic text}
-\rightarrow
-\text{calibration}.
-}
-$$
-
-我们的 MoE Self-Cal 应该是：
-
-$$
-\boxed{
-\textbf{Checkpoint-native interaction}
-\rightarrow
-\textbf{natural termination}
-\rightarrow
-\textbf{valid independent episodes}
-\rightarrow
-\textbf{MoE-conditioned statistics}
-\rightarrow
-\textbf{confidence-aware calibration}.
-}
-$$
-
-也就是说，我们不再认为：
-
-> “模型自己生成出来的 token 都天然是好的 calibration data。”
-
-而是更严格地要求：
-
-$$
-\boxed{
-\text{生成过程必须符合 checkpoint 自身的 operating format，
-生成状态必须非退化，
-而 MoE pruning 只在 self-cal statistics 足够稳定时才做激进决策。}
-}
-$$
-
-这版可以直接作为后续 Qwen3 / Qwen3.6 / Gemma4 统一重新生成 calibration 的协议。
-
----
-
-# 31. Reference implementation and validation
-
-本目录现在包含可执行的参考实现：
-
-* `build_native_calibration.py`：使用 checkpoint 自带 chat template 构造 user/assistant native scaffold，分别独立生成 user turn 和 assistant turn，允许自然终止，仅拒绝明确的机械生成故障，并将有效 episode 打包为固定长度 calibration blocks。
-* `inspect_native_calibration.py`：解码校准块，统计语言、主题、重复率和生成健康度，并输出代表性样本。
-* `test_native_calibration.py`：验证重复检测、固定 block 打包和 episode boundary 记录。
-
-## 31.1 Gemma4/Qwen3.6 的 user-turn 修复
-
-旧版虽然使用了 native chat template，但仍然错误地假设：
-
-$$
-P(\text{user content}\mid\text{user role prefix})
-$$
-
-是 checkpoint 的可靠生成分布。对 instruction checkpoint，这个条件通常没有得到充分训练；因此 user turn 可能从一开始就进入跨语言片段循环。旧版还在 `user + assistant + packed block` 上做质量检查，正常结束的 assistant 会把坏 user 的统计冲淡。
-
-当前 `cn_moe_sc_native_dialogue_v2_minimal_intervention` 的默认行为是：
-
-1. 使用 checkpoint native generation scaffold 做 bootstrap；
-2. 默认从训练得更充分的 assistant generation channel 生成候选语义内容，再把它作为下一轮 user content；
-3. 在 assistant 请求之前单独检查 user turn；
-4. 对 user 和 assistant 使用相同的最低限度 mechanical gate：只拒绝空输出、控制 token-only 输出和明显的 token/短 n-gram/周期循环；重复词组、script-switch、语言、列表、澄清和固定格式只作为诊断指标，不作为硬拒绝条件；
-5. 只有 user 通过后才生成 assistant；
-6. inspector 同时输出 user、assistant、episode 和 block 四种粒度，不能再用 block 指标掩盖坏 episode。
-
-澄清、拒答、列表、固定格式回答等语义模式本身属于 checkpoint 的自生成特征，不应因为“信息量低”而被删除。只有机械性的 token/短 n-gram/周期循环才进入 hard rejection。对 clarification mode 的正确处理是记录其比例、长度和跨 episode 的模式集中度；`inspect_native_calibration.py` 在有 episode boundary 时会按 assistant turn 输出 `semantic_modes.clarification_rows`、`clarification_rate`、不同澄清模板数和 top 模板，否则退化为 block-level 统计。如果它占比过高，应作为 generation-mode concentration 报告，不能冒充 broad-topic calibration，也不应在未定义采样混合策略的情况下擅自删除。
-
-三模型 pilot 脚本不再强行统一生成入口：Qwen3/Qwen3.6 使用 v1 的 `user_role_continuation`，Gemma4 使用 v2 的 `assistant_bootstrap`；三者共享同一套最低限度 mechanical gate 和诊断规则。
-
-## 31.2 v1/v2 的定义：模型原生行为的最低限度工程适配
-
-这里的 v1/v2 不表示两种预先规定的语义数据分布，也不表示对文本质量进行优化。它们表示：针对不同 checkpoint 的训练格式、native control tokens 和 instruction-following 行为，为了让模型产生**稳定、可观测、可用于 MoE 统计的 token 流**，所选择的两种最低限度工程入口。
-
-### v1：user-role continuation
-
-v1 从 checkpoint 的原生 user-role prefix 继续生成：
+从 checkpoint 的 native user-role prefix 继续生成：
 
 $$
 P_\theta(x\mid\text{native user-role prefix}).
 $$
 
-如果模型在该入口下能够稳定地产生用户问题、代码、文档或其他自然 continuation，就不再引入额外内容控制，直接保留这些 token。Qwen3 和 Qwen3.6 当前观察到的稳定 user continuation 属于这种情况。
+不注入人工主题、关键词或外部 prompt。对于 Qwen3/Qwen3.6，这条路径可以生成用户问题、代码、文档、数学和说明性文本，当前实验中相对稳定。
 
-### v2：assistant-channel bootstrap
+### 4.2 v2：`assistant_bootstrap`
 
-如果模型在 user-role prefix 后容易进入碎片或跨语言机械循环，则使用 checkpoint 原生 assistant generation channel 作为稳定入口：
-
-$$
-P_\theta(x\mid\text{native assistant-generation scaffold}),
-$$
-
-再将生成内容包装进 native user turn，继续完成 self-dialogue。这里的目标不是把 assistant 文本伪装成更高质量的 user 文本，而是利用该 checkpoint 已经训练得更稳定的 generation channel，避免生成系统本身先失效。Gemma4 当前观察到 v2 比 v1 稳定，属于这种工程适配。
-
-### 最小干预原则
-
-两种入口都必须满足：
-
-1. 只使用 checkpoint 自己的 tokenizer、chat template、role token、turn token 和 channel token；
-2. 不注入人工主题、关键词或外部语料；
-3. 不删除 clarification、refusal、list、boilerplate 或多语言等语义模式；
-4. 只拒绝明确的机械生成故障，例如极端 token/短 n-gram/周期循环；
-5. 记录实际使用的 generation mode、seed、终止状态、拒绝率和 mode concentration；
-6. 后续报告中明确不同模型使用的入口，不能把 v1/v2 的统计结果不加说明地当作完全相同的输入分布。
-
-因此，v1/v2 的选择依据是：
+如果 user-role continuation 对某个 checkpoint 容易进入碎片循环，则先使用 native assistant generation channel 产生候选内容，再包装进 user turn：
 
 $$
-	ext{checkpoint-native stability}
-\quad\text{而不是}\quad
-	ext{semantic preference or benchmark tuning}.
+P_\theta(x\mid\text{native assistant-generation scaffold}).
 $$
 
-它们对模型分布的影响应尽可能小，但不可能声称完全没有影响。正确做法是把入口选择作为 calibration provenance，并通过 expert hit frequency、router mass、conditional channel activation 以及 split-half stability 检查这种工程适配是否改变了后续 pruning 结论。
+v2 的作用是降低生成系统自身失效的概率，而不是把 assistant 内容伪装成“更好的 user 文本”。它会改变 measured input distribution，必须在 provenance 中记录。Gemma4 当前适合 v2；Qwen3 的 v2 容易集中到澄清套话。
 
-当前推荐是：
+### 4.3 当前推荐
 
-| 模型 | 推荐 generation mode | 选择理由 |
+| 模型 | generation mode | 原因 |
 |---|---|---|
-| Qwen3 | `user_role_continuation`（v1） | user-role continuation 稳定，能产生较丰富的自然内容 |
-| Qwen3.6 | `user_role_continuation`（v1） | v1 的输入状态更稳定，避免 assistant bootstrap 的澄清集中 |
-| Gemma4 | `assistant_bootstrap`（v2） | assistant generation channel 比 user-role continuation 更稳定 |
+| Qwen3 | v1 `user_role_continuation` | user-role continuation 稳定，内容和 routing 覆盖较丰富 |
+| Qwen3.6 | v1 `user_role_continuation` | 当前实测比 assistant bootstrap 更稳定，避免澄清模式集中 |
+| Gemma4 | v2 `assistant_bootstrap` | assistant channel 比 user-role continuation 更稳定，显著减少碎片循环 |
 
-这三个模型可以使用不同 generation mode，但必须使用相同的记录、统计和机械健康检查标准。换句话说，统一的是**校准目标和审计规则**，不是强行统一每个 checkpoint 的生成入口。
+这不是 benchmark tuning，而是 checkpoint-native stability adaptation。不同模型采用不同入口时，应分别解释统计结果，不能无说明地声称输入分布完全相同。
 
-注意：旧版 `cn_moe_sc_native_dialogue_v1` cache 没有 user-turn 级 provenance 和质量保证，不能通过重新运行 inspector 将其升级为 v2 健康 cache；必须重新生成。
+---
 
-默认协议参数为：
+## 5. 最新生成协议
+
+### 5.1 Native scaffold
+
+`build_native_calibration.py` 使用 tokenizer 的 `apply_chat_template()`，通过 sentinel 分割出：
+
+* user prefix；
+* user-to-assistant bridge；
+* assistant suffix。
+
+不手写 Qwen 或 Gemma4 的 token ID。当前实际解析结果为：
+
+| 模型 | user stop | assistant stop |
+|---|---|---|
+| Qwen3 | native `<|im_end|>` | native `<|im_end|>` |
+| Qwen3.6 | native `<|im_end|>` | native `<|im_end|>` |
+| Gemma4 | native `<turn|>` | native `<turn|>` |
+
+Gemma4 的 channel 前缀和 Qwen3.6 的 thinking-control 前缀由 native template 保留。
+
+### 5.2 Sampling
+
+默认采样尽量接近 checkpoint 自身分布：
 
 $$
 T=1,
-\quad top\_p=1,
-\quad top\_k=0,
-\quad repetition\_penalty=1,
-\quad ignore\_eos=False,
-\quad min\_tokens=0.
+\qquad top_p=1,
+\qquad top_k=0,
+\qquad repetition\_penalty=1.
 $$
 
-运行时不再使用人工 lexical prompt，也不再使用裸 BOS-only continuation。native scaffold 由 tokenizer 的 `apply_chat_template()` 动态解析，校准缓存会记录：
+同时使用：
 
-* native prefix、turn bridge 和 assistant suffix 的 token 长度；
-* 每个 episode 的 block boundary；
-* 自然终止率、拒绝率和拒绝原因对应的机械退化指标；
-* 固定 block 的 SHA256 和生成参数。
+* `ignore_eos=False`；
+* `min_tokens=0`；
+* 每个 episode 独立 seed；
+* user 和 assistant 各自的最大 token 上限；
+* 不使用人工 lexical prompt；
+* 不使用 English stopword allowlist；
+* 不使用 frequency penalty、presence penalty 或 no-repeat n-gram。
 
-示例：
+达到上限但没有 EOS 的 episode 会被记录为 capped，而不是被错误标记为 natural termination。
+
+### 5.3 User/assistant 生成顺序
+
+user 先生成。user 通过最低限度 mechanical gate 后，才请求 assistant：
+
+$$
+\text{generate user}
+\rightarrow
+\text{mechanical check}
+\rightarrow
+\text{generate assistant}
+\rightarrow
+\text{mechanical check}.
+$$
+
+user 不通过时不会调用 assistant，因此 assistant 的正常回答不能稀释坏 user 的统计。
+
+### 5.4 Health pilot 和 warm-up
+
+正式生成前运行 pilot。若 pilot 的 mechanical rejection rate 超过 `--max-pilot-rejection-rate`，才启用短前缀 temperature warm-up，默认候选为：
+
+$$
+T_{\rm prefix}=1.5,
+\qquad m=8.
+$$
+
+这只是 generation-health fallback，不是语义质量优化。warm-up 后仍不健康时直接失败，不无限重采样。
+
+---
+
+## 6. Hard gate 与 semantic diagnosis
+
+### 6.1 Hard gate：只拒绝机械故障
+
+当前 user/assistant 使用相同的最低限度 gate：
+
+* token 输出非空；
+* 若有 tokenizer，解码文本非空；
+* `distinct_token_ratio >= 0.02`；
+* `dominant_token_ratio <= 0.85`；
+* `max_run_ratio <= 0.60`；
+* `repeated_4gram_ratio <= 0.90`；
+* `periodic_loop_ratio <= 0.60`。
+
+这些阈值只针对明显机械退化，不能解释为语义质量阈值。极端案例仍应保留 rejected count 和 rejection rate，最好同时保留对应 diagnostics。
+
+### 6.2 Diagnostic-only semantic modes
+
+以下模式默认保留，不参与 hard rejection：
+
+* clarification；
+* refusal；
+* list/tutorial；
+* fixed-format/Markdown/template；
+* code/software；
+* math/science；
+* dialogue/QA；
+* story/narrative；
+* business/policy/society；
+* history/culture；
+* health/lifestyle；
+* multilingual text。
+
+当前 inspector 使用正则和关键词做启发式诊断，不是语义模型。类别允许重叠，不能相加为总数。应重点看：
+
+* mode rate；
+* 平均/中位 episode 长度；
+* distinct mode/template 数；
+* top clarification/refusal/fixed-format forms；
+* user 与 assistant 的分别统计；
+* mode concentration，而不是“模式是否足够丰富”。
+
+---
+
+## 7. Token budget、packing 与统计语义
+
+### 7.1 固定 budget 的真实含义
+
+默认目标是：
+
+$$
+128\times2048=262144
+$$
+
+个 **serialized cache tokens**，不是 128 个必须连续生成 2048 token 的回答，也不是 262144 个纯 lexical assistant tokens。
+
+预算包含：
+
+* native user prefix；
+* user content；
+* turn bridge；
+* assistant content；
+* native assistant suffix。
+
+因此 payload 中的 `calibration_tokens` 应理解为 cache token budget。若实验需要报告 lexical token budget，必须另行统计，不能与该字段混用。
+
+### 7.2 Packing
+
+独立 episode 会按顺序打包成 `[1, blocks × block_length]`，并记录：
+
+* `token_stream.episode_boundaries`；
+* `token_stream.block_boundaries`；
+* episode 是否跨 block；
+* source offset；
+* user/assistant token 数量和终止状态。
+
+packing 只是为了兼容现有 Wanda/ENP loader。它不能改变以下统计要求：
+
+$$
+\text{attention state}(e_j)
+\not\leftarrow
+\text{attention state}(e_{j-1}).
+$$
+
+当前 collector 尚未读取 boundary，因此现有 profile 结果不能自动宣称已经完成 episode-isolated forward。后续 collector 必须重建 episode，逐 episode forward 后再聚合 activation 和 routing statistics；不能把 block boundary 当成 episode boundary。
+
+---
+
+## 8. Calibration pool 与下游统计
+
+设计上可以将 serialized budget 分为：
+
+$$
+96\times2048\rightarrow\mathcal D_N,
+\qquad
+32\times2048\rightarrow\mathcal D_R.
+$$
+
+其中：
+
+* `D_N` 用于估计 natural expert prevalence 和条件 channel statistics；
+* `D_R` 只增加低样本 expert 的条件观测，不重新估计 natural prevalence；
+* guided samples 如未来启用，只能作为有偏的 conditional fallback，不能改变 prevalence。
+
+当前 builder 只把这些范围写入 `calibration_pools` metadata，还没有实现对应 collector 的统计隔离。因此现阶段不能把 metadata 当成已完成的 discovery/reserve 实验。
+
+后续应计算：
+
+### Expert hit frequency
+
+$$
+n_{l,i}=\sum_t\mathbf 1[e_i\in TopK_l(x_t)],
+\qquad
+m_{l,i}=\sum_t p_{l,i}(x_t).
+$$
+
+`n` 是 hard hit count，`m` 是 soft routing mass，两者必须分别报告。
+
+### Conditional channel activation
+
+$$
+A_{l,i,c}
+=
+\frac{
+\sum_t\mathbf 1[e_i\in TopK_l(x_t)]a_{l,i,c,t}^{2}
+}{
+\sum_t\mathbf 1[e_i\in TopK_l(x_t)]
+}.
+$$
+
+对于 Gemma4，需要按 native forward hook 区分 router input 和 routed-expert input；不能假设二者相同。
+
+### Channel functional contribution
+
+仅有 activation magnitude 不足以判断冗余。还应结合 down projection：
+
+$$
+F_{i,c}
+\approx
+E[(W_{i,\mathrm{down}}[:,c]a_{i,c})^{2}\mid e_i\text{ is hit}],
+$$
+
+以及 channel covariance：
+
+$$
+G_i=E[a_i a_i^{\mathsf T}].
+$$
+
+低 activation 不必然等于冗余，高 activation 也不必然等于不可剪；需要结合 activation、功能方向和 channel correlation。
+
+---
+
+## 9. 运行方式
+
+### 9.1 单元测试
+
+```bash
+pytest "calibration_method/self moe calibration/test_native_calibration.py" -q
+```
+
+测试覆盖：
+
+* token/短周期机械退化检测；
+* semantic mode 只诊断不硬过滤；
+* v1/v2 scaffold 处理；
+* warm-up mock；
+* 固定 block packing；
+* episode boundary 重构。
+
+### 9.2 单模型生成
+
+Qwen3/Qwen3.6 推荐显式使用 v1：
 
 ```bash
 python build_native_calibration.py \
-	--model-path /data01/datasets/Qwen3.6-35B-A3B \
-	--output /path/to/qwen36_cn_moe_sc.pt \
-	--blocks 128 --block-length 2048 --seed 42
+  --model-path /data01/datasets/Qwen3.6-35B-A3B \
+  --output /path/to/qwen36_cn_moe_sc.pt \
+  --blocks 128 \
+  --block-length 2048 \
+  --user-generation-mode user_role_continuation \
+  --seed 42
 ```
 
-生成后检查：
+Gemma4 推荐 v2：
 
 ```bash
-python inspect_native_calibration.py \
-	--cache /path/to/qwen36_cn_moe_sc.pt \
-	--model-path /data01/datasets/Qwen3.6-35B-A3B
+python build_native_calibration.py \
+  --model-path /data01/datasets/gemma-4-26B-A4B-it \
+  --output /path/to/gemma4_cn_moe_sc.pt \
+  --blocks 128 \
+  --block-length 2048 \
+  --user-generation-mode assistant_bootstrap \
+  --seed 42
 ```
 
-该实现将独立 episode 打包为固定长度 block，并在 `token_stream.episode_boundaries` 中保留边界；后续 MoE statistics collector 应按这些边界分别 forward，而不是把跨 episode 的 attention state 当作连续上下文。
+当前默认 CLI mode 是 `assistant_bootstrap`，因此 Qwen 单模型运行时不要省略 `--user-generation-mode user_role_continuation`。
 
-三个目标模型的小规模真实生成检查可以运行：
+### 9.3 三模型 pilot
 
 ```bash
 GPUS="0 1 2" bash run_three_model_pilots.sh
 ```
 
-脚本启动前会要求三张卡都没有 compute PID，避免抢占其他任务。每个模型先生成 2×256-token pilot cache，并输出：
+脚本会在启动前检查三张 GPU 是否存在 compute PID；不应抢占他人任务。它当前使用：
 
-* `<model>_generation.log`：生成过程和 validity gate；
-* `<model>_cn_moe_sc_pilot.pt`：共享 cache；
-* `<model>_inspection.json`：解码样本、语言/主题分布和重复退化指标。
+* Qwen3：v1；
+* Qwen3.6：v1；
+* Gemma4：v2；
+* 每个模型 2 个 256-token block；
+* 生成日志、cache 和 inspection JSON 分开保存。
 
-## Compatibility note
+### 9.4 Inspection
 
-固定 block cache 保持了现有 Wanda/ENP loader 所需的 `[1, blocks×block_length]` 结构，因此可以直接加载。但当前 Wanda/ENP collector 仍把每个 2048-token block 作为连续 attention context。严格遵循 CN-MoE-SC 定义时，collector 必须读取 `token_stream.episode_boundaries`，对每个 episode 分别 forward，再聚合 activation statistics。仅仅记录 boundary 而继续跨 episode attention，不等价于设计中要求的 independent forward。
+```bash
+python inspect_native_calibration.py \
+  --cache /path/to/qwen36_cn_moe_sc.pt \
+  --model-path /data01/datasets/Qwen3.6-35B-A3B \
+  --sample-count 8
+```
+
+检查时至少查看：
+
+* `generation_health`；
+* `quality.block`、`quality.episode`、`quality.user`、`quality.assistant`；
+* `semantic_modes` 的 block/episode/user/assistant 结果；
+* `user_samples` 和 `assistant_samples`；
+* episode 数量、平均长度和 capped/terminated 比例。
+
+---
+
+## 10. 结果解释原则
+
+### 应该回答的问题
+
+1. expert hit ranking 在不同 seed 或 split-half 下是否稳定？
+2. router mass ranking 是否稳定？
+3. 条件 channel activation ranking 是否稳定？
+4. v1/v2 的入口适配是否明显改变 expert prevalence？
+5. activation ranking 与 down-projection functional contribution 是否一致？
+6. pruning 后的性能变化能否由这些统计解释？
+
+### 不应该回答的问题
+
+* 校准文本是否主题均衡；
+* 是否每个 block 都包含代码、数学和故事；
+* clarification 是否“足够少”；
+* 文本是否像人工编写的 benchmark；
+* `unique_sequences=128` 是否足以证明多样性。
+
+最终应遵循：
+
+$$
+\boxed{
+\text{model-native generation}
+\rightarrow
+\text{minimum mechanical validation}
+\rightarrow
+\text{preserve semantic modes}
+\rightarrow
+\text{episode-isolated MoE statistics}
+}
+$$
+
+v1/v2 的选择是为了让不同 checkpoint 能稳定地产生可测量状态；校准集最终是否有价值，应由 expert 命中频率、conditional activation 和统计稳定性判断，而不是由文本表面质量判断。
