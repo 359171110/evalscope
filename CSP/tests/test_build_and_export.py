@@ -182,6 +182,51 @@ def test_hsp_heterogeneous_export_supports_packed_and_shared_layouts(
         assert handle.get_tensor(routed_name).shape[-2 if family == "gemma4" else 0] > 0
 
 
+@pytest.mark.parametrize("family", ["qwen3.6", "gemma4"])
+def test_hsp_packed_export_pads_gate_and_up_halves_separately(
+    tmp_path: Path,
+    monkeypatch,
+    family: str,
+) -> None:
+    widths, budget, physical_width = (
+        ((192, 256, 320), 256, 320) if family == "qwen3.6" else ((288, 352, 416), 352, 416)
+    )
+    model = tmp_path / f"{family}-hsp-packed-model"
+    write_checkpoint(model, family, large=True)
+    artifact = tmp_path / f"{family}-hsp-packed-artifact"
+    cache = artifact / "csp_rankings.pt"
+    profile = artifact / "hsp_profile.pt"
+    monkeypatch.setattr("sys.argv", [
+        "build_csp_artifacts", "--model-path", str(model),
+        "--output-channel-cache", str(cache), "--output-profile", str(profile),
+        "--heterogeneous-widths", *(str(width) for width in widths),
+        "--budget-width", str(budget), "--apply-input-scale", "never",
+    ])
+    assert build_main() == 0
+    output = tmp_path / f"{family}-hsp-packed-output"
+    monkeypatch.setattr("sys.argv", [
+        "export_csp_checkpoint", "--model-path", str(model), "--profile", str(profile),
+        "--channel-cache", str(cache), "--output-dir", str(output),
+    ])
+    assert export_main() == 0
+
+    payload = torch.load(profile, map_location="cpu", weights_only=True)
+    index = json.loads((output / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    routed_name = next(name for name in index["weight_map"] if name.endswith("gate_up_proj"))
+    with safe_open(output / index["weight_map"][routed_name], framework="pt", device="cpu") as handle:
+        packed = handle.get_tensor(routed_name)
+    assert packed.shape[1] == 2 * physical_width
+    block = int(payload["channel_block_size"])
+    for expert_id in range(int(payload["num_experts"])):
+        logical = int(payload["profile_widths"][0, expert_id].item()) * block
+        gate_slot = packed[expert_id, :physical_width]
+        up_slot = packed[expert_id, physical_width:]
+        assert torch.count_nonzero(gate_slot[logical:]) == 0
+        assert torch.count_nonzero(up_slot[logical:]) == 0
+        assert torch.count_nonzero(gate_slot[:logical]) > 0
+        assert torch.count_nonzero(up_slot[:logical]) > 0
+
+
 def test_qwen3_heterogeneous_export_pads_logical_experts_to_common_width(
     tmp_path: Path, monkeypatch
 ) -> None:

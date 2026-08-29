@@ -141,9 +141,13 @@ def prune_routed_tensor(
             selected = []
             for expert_id in range(architecture.num_experts):
                 indices = retained[(layer_id, expert_id)]
-                packed_indices = torch.cat((indices, indices + architecture.intermediate_size))
-                expert = source[expert_id].index_select(0, packed_indices)
-                selected.append(pad_rows(expert, 2 * int(padded_width)) if padded_width is not None else expert)
+                packed = source[expert_id]
+                gate = packed.index_select(0, indices)
+                up = packed.index_select(0, indices + architecture.intermediate_size)
+                if padded_width is not None:
+                    gate = pad_rows(gate, int(padded_width))
+                    up = pad_rows(up, int(padded_width))
+                selected.append(torch.cat((gate, up), dim=0))
             return torch.stack(selected), True
         if name == adapter.down_name(layer_id):
             selected = [source[expert_id].index_select(1, retained[(layer_id, expert_id)]) for expert_id in range(architecture.num_experts)]
