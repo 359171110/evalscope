@@ -73,10 +73,17 @@ class CSPModelAdapter:
         config = json.loads((model_path / "config.json").read_text(encoding="utf-8"))
         text_config = config.get("text_config", config)
         model_type = str(text_config.get("model_type", config.get("model_type", ""))).lower()
-        num_experts = int(text_config.get("num_experts", text_config.get("n_routed_experts", 0)))
+        num_experts = int(
+            text_config.get(
+                "num_experts",
+                text_config.get("n_routed_experts", text_config.get("num_local_experts", 0)),
+            )
+        )
         common = {
             "hidden_size": int(text_config["hidden_size"]),
-            "intermediate_size": int(text_config["moe_intermediate_size"]),
+            "intermediate_size": int(
+                text_config["moe_intermediate_size"] if "moe_intermediate_size" in text_config else text_config["intermediate_size"]
+            ),
             "num_layers": int(text_config["num_hidden_layers"]),
             "num_experts": num_experts,
             "activation": str(text_config.get("hidden_activation", text_config.get("hidden_act", "silu"))),
@@ -158,6 +165,44 @@ class CSPModelAdapter:
                 gate_template="model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
                 up_template="model.layers.{layer}.mlp.experts.{expert}.up_proj.weight",
                 down_template="model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+            )
+        elif model_type == "olmoe":
+            architecture = CSPArchitecture(
+                model_family="olmoe",
+                model_type=model_type,
+                router_top_k=int(text_config["num_experts_per_tok"]),
+                tensor_codec="separate",
+                channel_alignment=64,
+                branch_topology="routed_only",
+                **common,
+            )
+            adapter = cls(
+                architecture=architecture,
+                text_config=text_config,
+                router_template="model.layers.{layer}.mlp.gate.weight",
+                gate_up_template=None,
+                gate_template="model.layers.{layer}.mlp.experts.{expert}.gate_proj.weight",
+                up_template="model.layers.{layer}.mlp.experts.{expert}.up_proj.weight",
+                down_template="model.layers.{layer}.mlp.experts.{expert}.down_proj.weight",
+            )
+        elif model_type == "mixtral":
+            architecture = CSPArchitecture(
+                model_family="mixtral",
+                model_type=model_type,
+                router_top_k=int(text_config["num_experts_per_tok"]),
+                tensor_codec="separate",
+                channel_alignment=64,
+                branch_topology="routed_only",
+                **common,
+            )
+            adapter = cls(
+                architecture=architecture,
+                text_config=text_config,
+                router_template="model.layers.{layer}.block_sparse_moe.gate.weight",
+                gate_up_template=None,
+                gate_template="model.layers.{layer}.block_sparse_moe.experts.{expert}.w1.weight",
+                up_template="model.layers.{layer}.block_sparse_moe.experts.{expert}.w3.weight",
+                down_template="model.layers.{layer}.block_sparse_moe.experts.{expert}.w2.weight",
             )
         else:
             raise ValueError(f"Unsupported CSP model type: {model_type!r}.")

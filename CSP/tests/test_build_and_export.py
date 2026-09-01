@@ -18,7 +18,7 @@ def build_and_export(tmp_path: Path, monkeypatch, family: str) -> tuple[Path, Pa
     artifact = tmp_path / f"{family}-artifact"
     cache = artifact / "csp_rankings.pt"
     profile = artifact / "profile.pt"
-    retained = 64 if family in {"qwen3", "qwen3.6"} else 32
+    retained = 64 if family in {"qwen3", "qwen3.6", "olmoe", "mixtral"} else 32
     monkeypatch.setattr("sys.argv", [
         "build_csp_artifacts", "--model-path", str(model), "--output-channel-cache", str(cache),
         "--output-profile", str(profile), "--retained-channels", str(retained),
@@ -33,7 +33,7 @@ def build_and_export(tmp_path: Path, monkeypatch, family: str) -> tuple[Path, Pa
     return output, cache, profile, source
 
 
-@pytest.mark.parametrize("family", ["qwen3", "gemma4", "qwen3.6", "deepseek"])
+@pytest.mark.parametrize("family", ["qwen3", "gemma4", "qwen3.6", "deepseek", "olmoe", "mixtral"])
 def test_build_and_export_all_requested_families(tmp_path: Path, monkeypatch, family: str) -> None:
     output, cache_path, profile_path, _ = build_and_export(tmp_path, monkeypatch, family)
     cache = torch.load(cache_path, map_location="cpu", weights_only=True)
@@ -44,9 +44,13 @@ def test_build_and_export_all_requested_families(tmp_path: Path, monkeypatch, fa
     assert cache["csp"]["weight_only"] is True
     assert cache["csp"]["canonicalization"] is False
     assert profile["method"] == "csp"
-    assert profile["retained_channels"] == (64 if family in {"qwen3", "qwen3.6"} else 32)
+    assert profile["retained_channels"] == (64 if family in {"qwen3", "qwen3.6", "olmoe", "mixtral"} else 32)
     assert manifest["method"] == "csp"
-    assert manifest["retained_channels"] == (64 if family in {"qwen3", "qwen3.6"} else 32)
+    assert manifest["retained_channels"] == (64 if family in {"qwen3", "qwen3.6", "olmoe", "mixtral"} else 32)
+    if family in {"olmoe", "mixtral"}:
+        config = json.loads((output / "config.json").read_text(encoding="utf-8"))
+        assert config["intermediate_size"] == 64
+        assert "moe_intermediate_size" not in config
 
 
 def test_gemma4_build_uses_expert_input_scale_and_preserves_non_routed_norm(tmp_path: Path, monkeypatch) -> None:
@@ -101,6 +105,8 @@ def test_qwen3_heterogeneous_profile_has_fixed_layer_budget(tmp_path: Path, monk
         ("qwen3.6", (192, 256, 320), 256),
         ("gemma4", (288, 352, 416), 352),
         ("deepseek", (576, 704, 832), 704),
+        ("olmoe", (448, 512, 576), 512),
+        ("mixtral", (448, 512, 576), 512),
     ],
 )
 def test_hsp_heterogeneous_profile_supports_all_model_families(
@@ -137,6 +143,8 @@ def test_hsp_heterogeneous_profile_supports_all_model_families(
         ("qwen3.6", (192, 256, 320), 256, 320),
         ("gemma4", (288, 352, 416), 352, 416),
         ("deepseek", (576, 704, 832), 704, 832),
+        ("olmoe", (448, 512, 576), 512, 576),
+        ("mixtral", (448, 512, 576), 512, 576),
     ],
 )
 def test_hsp_heterogeneous_export_supports_packed_and_shared_layouts(
@@ -168,7 +176,11 @@ def test_hsp_heterogeneous_export_supports_packed_and_shared_layouts(
 
     config = json.loads((output / "config.json").read_text(encoding="utf-8"))
     text_config = config.get("text_config", config)
-    assert text_config["moe_intermediate_size"] == physical_width
+    if family in {"olmoe", "mixtral"}:
+        assert text_config["intermediate_size"] == physical_width
+        assert "moe_intermediate_size" not in text_config
+    else:
+        assert text_config["moe_intermediate_size"] == physical_width
     manifest = json.loads((output / "pruning_export_manifest.json").read_text(encoding="utf-8"))
     assert manifest["method"] == "hsp"
     assert manifest["padded_intermediate_size"] == physical_width
@@ -176,7 +188,7 @@ def test_hsp_heterogeneous_export_supports_packed_and_shared_layouts(
 
     index = json.loads((output / "model.safetensors.index.json").read_text(encoding="utf-8"))
     routed_name = next(name for name in index["weight_map"] if "experts" in name and (
-        name.endswith("gate_up_proj") or name.endswith("gate_proj.weight")
+        name.endswith("gate_up_proj") or name.endswith("gate_proj.weight") or name.endswith("w1.weight")
     ))
     with safe_open(output / index["weight_map"][routed_name], framework="pt", device="cpu") as handle:
         assert handle.get_tensor(routed_name).shape[-2 if family == "gemma4" else 0] > 0

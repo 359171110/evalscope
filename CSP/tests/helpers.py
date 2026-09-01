@@ -22,7 +22,7 @@ def _rows(width: int, hidden: int, expert_id: int) -> torch.Tensor:
 
 
 def write_checkpoint(path: Path, family: str, large: bool = False) -> dict[str, torch.Tensor]:
-    """Write a small safetensors fixture for one of the four supported families."""
+    """Write a small safetensors fixture for one supported model family."""
 
     path.mkdir()
     if family == "qwen3":
@@ -105,6 +105,32 @@ def write_checkpoint(path: Path, family: str, large: bool = False) -> dict[str, 
             "if config.n_shared_experts is not None:\n"
             "            intermediate_size = config.moe_intermediate_size * config.n_shared_experts\n"
             "            self.shared_experts = None\n", encoding="utf-8")
+    elif family == "olmoe":
+        width, hidden, experts = (1024, 4, 4) if large else (128, 4, 2)
+        config = {
+            "model_type": "olmoe", "hidden_size": hidden, "hidden_act": "silu",
+            "intermediate_size": width, "num_hidden_layers": 1,
+            "num_experts": experts, "num_experts_per_tok": 1,
+        }
+        tensors = {"model.layers.0.mlp.gate.weight": torch.ones(experts, hidden)}
+        for expert in range(experts):
+            prefix = f"model.layers.0.mlp.experts.{expert}"
+            tensors[f"{prefix}.gate_proj.weight"] = _rows(width, hidden, expert)
+            tensors[f"{prefix}.up_proj.weight"] = torch.ones(width, hidden)
+            tensors[f"{prefix}.down_proj.weight"] = torch.ones(hidden, width)
+    elif family == "mixtral":
+        width, hidden, experts = (1024, 4, 4) if large else (128, 4, 2)
+        config = {
+            "model_type": "mixtral", "hidden_size": hidden, "hidden_act": "silu",
+            "intermediate_size": width, "num_hidden_layers": 1,
+            "num_local_experts": experts, "num_experts_per_tok": 1,
+        }
+        tensors = {"model.layers.0.block_sparse_moe.gate.weight": torch.ones(experts, hidden)}
+        for expert in range(experts):
+            prefix = f"model.layers.0.block_sparse_moe.experts.{expert}"
+            tensors[f"{prefix}.w1.weight"] = _rows(width, hidden, expert)
+            tensors[f"{prefix}.w3.weight"] = torch.ones(width, hidden)
+            tensors[f"{prefix}.w2.weight"] = torch.ones(hidden, width)
     else:
         raise ValueError(family)
     save_file(tensors, path / "model.safetensors")

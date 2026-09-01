@@ -15,6 +15,8 @@ from CSP.tests.helpers import write_checkpoint
         ("gemma4", "gemma4", "packed", 0, 32),
         ("qwen3.6", "qwen3.6", "packed", 0, 64),
         ("deepseek", "deepseek_v2", "separate", 1, 32),
+        ("olmoe", "olmoe", "separate", 0, 64),
+        ("mixtral", "mixtral", "separate", 0, 64),
     ],
 )
 def test_adapter_supports_requested_model_families(
@@ -35,7 +37,7 @@ def test_adapter_supports_requested_model_families(
 
 
 def test_only_gemma4_declares_architecture_aware_input_scale(tmp_path: Path) -> None:
-    for family in ("qwen3", "qwen3.6", "deepseek"):
+    for family in ("qwen3", "qwen3.6", "deepseek", "olmoe", "mixtral"):
         model_path = tmp_path / family
         tensors = write_checkpoint(model_path, family)
         adapter = CSPModelAdapter.from_checkpoint(model_path, {name: "model.safetensors" for name in tensors})

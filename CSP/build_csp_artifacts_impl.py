@@ -259,7 +259,7 @@ def build_heterogeneous_profile(
     """Build an HSP-Hetero profile with fixed Expert-SP quantile tiers."""
 
     architecture = adapter.architecture
-    if architecture.model_family not in {"qwen3", "qwen3.6", "gemma4", "deepseek_v2"}:
+    if architecture.model_family not in {"qwen3", "qwen3.6", "gemma4", "deepseek_v2", "olmoe", "mixtral"}:
         raise ValueError("HSP-Hetero does not support this model family.")
     if canonicalize:
         raise ValueError("HSP-Hetero uses raw Expert-SP and raw Channel-SP; canonicalization is not supported.")

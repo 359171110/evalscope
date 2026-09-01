@@ -120,6 +120,7 @@ RMSNorm 本身不被错误地吸收到权重中。当前实现对 Gemma4 自动�
 | Qwen3.6 | `qwen3_5_moe_text` | packed | 64 | 384 | 256 |
 | Gemma4 | `gemma4_text` | packed | 32 | 512 | 352 |
 | DeepSeek-V2-Lite | `deepseek_v2` | separate | 32 | 1056 | 704 |
+| OLMoE-1B-7B | `olmoe` | separate | 64 | 768 | 512 |
 
 主要入口：
 
@@ -189,7 +190,9 @@ $k_0+64$ 和 $k_0-64$ 两档分别分配给 $E/4$ 个 experts，
 | Qwen3 | 320 | 384 | 448 |
 | Qwen3.6 | 192 | 256 | 320 |
 | Gemma4 | 288 | 352 | 416 |
-| DeepSeek-V2-Lite | 576 | 704 | 832 |
+| DeepSeek-V2-Lite | 640 | 704 | 768 |
+| OLMoE-1B-7B | 448 | 512 | 576 |
+| Mixtral-8x7B | 7104 | 7168 | 7232 |
 
 上述数值用于文档说明与离线配置记录，不需要运行 build 即可确认。
 
@@ -200,7 +203,7 @@ bash CSP/run_prepare.sh qwen3 "" /path/to/hsp-artifacts
 ```
 
 其他模型的默认三档为：Qwen3=`320/384/448`、Qwen3.6=`192/256/320`、
-Gemma4=`288/352/416`、DeepSeek-V2-Lite=`576/704/832`；分别通过
+Gemma4=`288/352/416`、DeepSeek-V2-Lite=`640/704/768`、OLMoE=`448/512/576`、Mixtral=`7104/7168/7232`；分别通过
 `CSP_HETEROGENEOUS_WIDTHS` 与 `CSP_BUDGET_WIDTH` 传入。标准 HF/vLLM 导出统一
 zero-pad 到高档物理宽度，不能据此宣称已经获得真实异构 kernel 加速。
 

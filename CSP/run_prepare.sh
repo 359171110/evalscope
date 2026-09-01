@@ -31,8 +31,10 @@ case "$MODEL" in
     qwen36) DEFAULT_MODEL_PATH="${QWEN36_MODEL_PATH:-/data01/datasets/Qwen3.6-35B-A3B}" ;;
     gemma4) DEFAULT_MODEL_PATH="${GEMMA4_MODEL_PATH:-/data01/datasets/gemma-4-26B-A4B-it}" ;;
     deepseek) DEFAULT_MODEL_PATH="${DEEPSEEK_MODEL_PATH:-/data01/datasets/DeepSeek-V2-Lite-Chat}" ;;
+    olmoe) DEFAULT_MODEL_PATH="${OLMOE_MODEL_PATH:-/data1/xinpeigao/caches/huggingface/hub/models--allenai--OLMoE-1B-7B-0125-Instruct/snapshots/b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e}" ;;
+    mixtral) DEFAULT_MODEL_PATH="${MIXTRAL_MODEL_PATH:-/data1/xinpeigao/caches/huggingface/hub/models--mistralai--Mixtral-8x7B-Instruct-v0.1/snapshots/eba92302a2861cdc0098cc54bc9f17cb2c47eb61}" ;;
     all) die "Use one model at a time because model paths can be on different servers." ;;
-    *) die "MODEL must be qwen3, qwen36, gemma4, or deepseek." ;;
+    *) die "MODEL must be qwen3, qwen36, gemma4, deepseek, olmoe, or mixtral." ;;
 esac
 MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
 [[ -n "$MODEL_PATH" ]] || die "Set the corresponding model path environment variable."
@@ -41,9 +43,17 @@ MODEL_PATH="${MODEL_PATH:-$DEFAULT_MODEL_PATH}"
 if [[ -n "$HETEROGENEOUS_WIDTHS" ]]; then
     case "$MODEL:$BUDGET_WIDTH:$HETEROGENEOUS_WIDTHS" in
         qwen3:384:"320 384 448") ;;
+        qwen3:576:"512 576 640") ;;
         qwen36:256:"192 256 320") ;;
+        qwen36:384:"320 384 448") ;;
         gemma4:352:"288 352 416") ;;
-        deepseek:704:"576 704 832") ;;
+        gemma4:512:"448 512 576") ;;
+        deepseek:704:"640 704 768") ;;
+        deepseek:1056:"992 1056 1120") ;;
+        olmoe:512:"448 512 576") ;;
+        olmoe:768:"704 768 832") ;;
+        mixtral:7168:"7104 7168 7232") ;;
+        mixtral:10752:"10688 10752 10816") ;;
         *) die "Unsupported HSP-Hetero configuration for $MODEL: widths='$HETEROGENEOUS_WIDTHS', budget='$BUDGET_WIDTH'." ;;
     esac
     ARTIFACT_ROOT="$OUTPUT_ROOT/${MODEL}_heterogeneous_${HETEROGENEOUS_WIDTHS// /_}_budget${BUDGET_WIDTH}"

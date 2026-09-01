@@ -215,7 +215,7 @@ def main() -> int:
     widths = profile["profile_widths"].long()
     heterogeneous = profile.get("allocation_scope") == "per_layer_expert_sp_quantiles"
     if heterogeneous:
-        if architecture.model_family not in {"qwen3", "qwen3.6", "gemma4", "deepseek_v2"}:
+        if architecture.model_family not in {"qwen3", "qwen3.6", "gemma4", "deepseek_v2", "olmoe", "mixtral"}:
             raise ValueError("heterogeneous CSP export does not support this model family.")
         if cache.get("csp", {}).get("canonicalization") is not False:
             raise ValueError("heterogeneous CSP export requires raw Expert-SP and raw Channel-SP scoring.")
@@ -267,7 +267,10 @@ def main() -> int:
     text_config = config.get("text_config", config)
     exported_shared_width = fused_shared_expert_width(text_config) if architecture.model_family == "deepseek_v2" else None
     exported_width = int(padded_width) if heterogeneous else retained_channels
-    text_config["moe_intermediate_size"] = exported_width
+    if architecture.model_family in {"olmoe", "mixtral"}:
+        text_config["intermediate_size"] = exported_width
+    else:
+        text_config["moe_intermediate_size"] = exported_width
     if exported_shared_width is not None:
         text_config["shared_expert_intermediate_size"] = exported_shared_width
     (output_dir / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -296,6 +299,7 @@ def main() -> int:
         "allocation_scope": profile.get("allocation_scope"),
         "source_expert_width": architecture.intermediate_size,
         "exported_moe_intermediate_size": exported_width,
+        "exported_expert_intermediate_size": exported_width,
         "exported_shared_expert_intermediate_size": exported_shared_width,
         "export_layout": "slice_uniform_width_padded" if heterogeneous else "slice_uniform_width",
         "actual_structural_pruning_ratio": 1.0 - retained_channels / architecture.intermediate_size,
