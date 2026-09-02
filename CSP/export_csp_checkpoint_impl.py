@@ -196,8 +196,10 @@ def main() -> int:
     profile = torch.load(profile_path, map_location="cpu", weights_only=True)
     cache = torch.load(channel_path, map_location="cpu", weights_only=True)
     validate_static_profile_payload(profile)
-    if profile.get("method") not in {"csp", "hsp", "ahsp"} or cache.get("purpose") != "csp_channel_ranking":
-        raise ValueError("Expected a CSP/HSP profile and CSP channel ranking cache.")
+    if profile.get("method") not in {"csp", "hsp", "ahsp", "harp"} or cache.get("purpose") not in {
+        "csp_channel_ranking", "harp_channel_ranking",
+    }:
+        raise ValueError("Expected a CSP/HSP/AHSP/HARP profile and matching channel ranking cache.")
     if profile["cache_provenance"]["channel"]["sha256"] != file_sha256(channel_path):
         raise ValueError("CSP channel cache SHA256 does not match the profile.")
     index_path = model_path / "model.safetensors.index.json"
@@ -216,6 +218,7 @@ def main() -> int:
     heterogeneous = profile.get("allocation_scope") in {
         "per_layer_expert_sp_quantiles",
         "per_layer_expert_ahsp_risk_curve",
+        "per_layer_expert_harp_layer_expert_channel_sp",
     }
     if heterogeneous:
         if architecture.model_family not in {"qwen3", "qwen3.6", "gemma4", "deepseek_v2", "olmoe", "mixtral"}:
