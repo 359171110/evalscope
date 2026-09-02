@@ -98,6 +98,26 @@ def test_qwen3_heterogeneous_profile_has_fixed_layer_budget(tmp_path: Path, monk
     assert payload["width_options"] == [320, 384, 448]
 
 
+def test_qwen3_ahsp_profile_has_exact_layer_budget(tmp_path: Path, monkeypatch) -> None:
+    model = tmp_path / "qwen3-ahsp-model"
+    write_checkpoint(model, "qwen3", large=True)
+    artifact = tmp_path / "qwen3-ahsp-artifact"
+    cache = artifact / "csp_rankings.pt"
+    profile = artifact / "ahsp_profile.pt"
+    monkeypatch.setattr("sys.argv", [
+        "build_csp_artifacts", "--model-path", str(model),
+        "--output-channel-cache", str(cache), "--output-profile", str(profile),
+        "--ahsp", "--ahsp-min-width", "64", "--budget-width", "128", "--ahsp-max-width", "192",
+    ])
+    assert build_main() == 0
+    payload = torch.load(profile, map_location="cpu", weights_only=True)
+    widths = payload["profile_widths"] * payload["channel_block_size"]
+    assert payload["method"] == "ahsp"
+    assert payload["allocation_scope"] == "per_layer_expert_ahsp_risk_curve"
+    assert widths.sum(dim=1).tolist() == [payload["num_experts"] * 128] * payload["num_layers"]
+    assert bool((widths >= 64).all() and (widths <= 192).all())
+
+
 @pytest.mark.parametrize(
     ("family", "widths", "budget"),
     [

@@ -341,6 +341,92 @@ def allocate_participation_widths(
     return torch.tensor(states[budget][1], dtype=torch.long)
 
 
+def ahsp_risk_curve(
+    channel_scores: torch.Tensor,
+    expert_score: torch.Tensor,
+    block_size: int = 1,
+) -> torch.Tensor:
+    """Build normalized expert-specific AHSP compression risk curves.
+
+    ``channel_scores`` are complete descending channel scores for one layer.
+    The score scale is converted back to positive structural mass; only the
+    relative tail mass matters for the fixed-budget allocation.
+    """
+
+    if channel_scores.ndim != 2 or expert_score.ndim != 1:
+        raise ValueError("AHSP scores must have shapes [experts, channels] and [experts].")
+    experts, channels = (int(size) for size in channel_scores.shape)
+    block = int(block_size)
+    if int(expert_score.numel()) != experts or channels <= 0 or block <= 0 or channels % block:
+        raise ValueError("AHSP score dimensions do not match.")
+    finite = torch.isfinite(channel_scores)
+    mass = torch.where(
+        finite,
+        torch.exp(channel_scores.to(torch.float64).clamp(min=-80.0, max=80.0)),
+        torch.zeros_like(channel_scores, dtype=torch.float64),
+    )
+    total = mass.sum(dim=1, keepdim=True).clamp_min(torch.finfo(torch.float64).tiny)
+    if block > 1:
+        mass = mass.reshape(experts, channels // block, block).sum(dim=2)
+        total = mass.sum(dim=1, keepdim=True).clamp_min(torch.finfo(torch.float64).tiny)
+    cumulative = mass.cumsum(dim=1) / total
+    tail = torch.cat((torch.ones((experts, 1), dtype=torch.float64), 1.0 - cumulative), dim=1)
+    expert_mass = torch.exp(expert_score.to(torch.float64).clamp(min=-80.0, max=80.0))
+    expert_mass /= expert_mass.mean().clamp_min(torch.finfo(torch.float64).tiny)
+    return (tail * expert_mass.unsqueeze(1)).to(torch.float32)
+
+
+def allocate_ahsp_widths(
+    risk_curves: torch.Tensor,
+    *,
+    total_blocks: int,
+    min_blocks: int,
+    max_blocks: int,
+    baselines: list[torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Allocate blocks by greedy marginal risk reduction with safeguards."""
+
+    if risk_curves.ndim != 3:
+        raise ValueError("risk_curves must have shape [layers, experts, blocks + 1].")
+    layers, experts, curve_points = (int(size) for size in risk_curves.shape)
+    blocks = curve_points - 1
+    if blocks <= 0:
+        raise ValueError("risk_curves must contain at least one block interval.")
+    minimum, maximum, budget = int(min_blocks), int(max_blocks), int(total_blocks)
+    if not 0 <= minimum <= maximum <= blocks or budget < layers * experts * minimum:
+        raise ValueError("Invalid AHSP width bounds or budget.")
+    if budget > layers * experts * maximum:
+        raise ValueError("AHSP budget exceeds the width bounds.")
+
+    def objective(widths: torch.Tensor) -> float:
+        selected = risk_curves.gather(2, widths.unsqueeze(-1)).squeeze(-1)
+        return float(selected.sum().item())
+
+    candidates = [torch.full((layers, experts), minimum, dtype=torch.long)]
+    current = candidates[0].clone()
+    remaining = budget - int(current.sum().item())
+    for _ in range(remaining):
+        best_key: tuple[float, int, int] | None = None
+        for layer in range(layers):
+            for expert in range(experts):
+                width = int(current[layer, expert])
+                if width >= maximum:
+                    continue
+                gain = float(risk_curves[layer, expert, width].item() - risk_curves[layer, expert, width + 1].item())
+                key = (gain, -layer, -expert)
+                if best_key is None or key > best_key:
+                    best_key = key
+                    best = (layer, expert)
+        if best_key is None:
+            raise RuntimeError("AHSP could not satisfy the exact budget.")
+        current[best] += 1
+    candidates.append(current.clone())
+    if baselines:
+        candidates.extend(baselines)
+    valid = [candidate for candidate in candidates if int(candidate.sum()) == budget]
+    return min(valid, key=objective)
+
+
 def retained_prefix(order: torch.Tensor, retained_channels: int) -> torch.Tensor:
     """Return the highest-ranked CSP channels."""
 

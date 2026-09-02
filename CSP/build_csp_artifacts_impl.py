@@ -17,6 +17,8 @@ from CSP.csp_core import (
     expert_structural_score_packed,
     file_sha256,
     canonical_structural_score_packed,
+    ahsp_risk_curve,
+    allocate_ahsp_widths,
     ranking_table,
     validate_rankings,
 )
@@ -360,6 +362,129 @@ def build_heterogeneous_profile(
     return profile
 
 
+def build_ahsp_profile(
+    *,
+    model_path: Path,
+    adapter: CSPModelAdapter,
+    tables: dict[int, dict[str, torch.Tensor | int]],
+    budget_width: int,
+    min_width: int,
+    max_width: int,
+    apply_input_scale: bool,
+    canonicalize: bool,
+) -> dict[str, Any]:
+    """Build an Adaptive HSP profile from expert/channel compression curves."""
+
+    architecture = adapter.architecture
+    if canonicalize or apply_input_scale:
+        raise ValueError("AHSP requires raw expert and channel signatures without input scaling.")
+    block_size = architecture.channel_alignment
+    for width in (min_width, budget_width, max_width):
+        architecture.validate_width(int(width))
+    if not min_width <= budget_width <= max_width:
+        raise ValueError("AHSP widths must satisfy min_width <= budget_width <= max_width.")
+    if (budget_width - min_width) % block_size or (max_width - min_width) % block_size:
+        raise ValueError("AHSP widths must be aligned to the channel block size.")
+
+    moe_ids = architecture.moe_layer_ids()
+    widths_by_layer: list[torch.Tensor] = []
+    risk_by_layer: list[list[list[float]]] = []
+    hsp_widths_by_layer: list[torch.Tensor] = []
+    csp_widths_by_layer: list[torch.Tensor] = []
+    min_blocks, budget_blocks, max_blocks = (width // block_size for width in (min_width, budget_width, max_width))
+    target_blocks = architecture.num_experts * budget_blocks
+    for layer_id in moe_ids:
+        table = tables[int(layer_id)]
+        channel_scores = table["channel_scores"]
+        ranked_indices = table["ranked_indices"]
+        expert_scores = table["expert_structural_scores"]
+        ranked_scores = torch.gather(channel_scores.to(torch.float32), 1, ranked_indices.to(torch.long))
+        curves = ahsp_risk_curve(
+            ranked_scores,
+            expert_scores.to(torch.float32),
+            block_size=block_size,
+        )
+        hsp_order = torch.argsort(expert_scores, descending=True, stable=True)
+        hsp_widths = torch.full((architecture.num_experts,), budget_blocks, dtype=torch.long)
+        quarter = architecture.num_experts // 4
+        hsp_widths[hsp_order[:quarter]] = max_blocks
+        hsp_widths[hsp_order[-quarter:]] = min_blocks
+        csp_widths = torch.full((architecture.num_experts,), budget_blocks, dtype=torch.long)
+        selected = allocate_ahsp_widths(
+            curves.unsqueeze(0),
+            total_blocks=target_blocks,
+            min_blocks=min_blocks,
+            max_blocks=max_blocks,
+            baselines=[hsp_widths.unsqueeze(0), csp_widths.unsqueeze(0)],
+        )[0]
+        widths_by_layer.append(selected)
+        hsp_widths_by_layer.append(hsp_widths)
+        csp_widths_by_layer.append(csp_widths)
+        risk_by_layer.append(curves.tolist())
+
+    widths = torch.stack(widths_by_layer)
+    hsp_widths = torch.stack(hsp_widths_by_layer)
+    if widths.sum(dim=1).tolist() != [target_blocks] * len(moe_ids):
+        raise RuntimeError("AHSP allocation violated the exact per-layer budget.")
+    num_blocks = architecture.intermediate_size // block_size
+    total_blocks = int(widths.sum().item())
+    profile = {
+        "schema_version": 1,
+        "method": "ahsp",
+        "mode": "ahsp_adaptive_risk_curve",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "model_path": str(model_path),
+        "model_family": architecture.model_family,
+        "profile_construction": "calibration_free",
+        "calibration_split": "not_applicable",
+        "calibration_frozen_before_evaluation": True,
+        "test_metrics_used_for_profile": False,
+        "layer_ids": list(moe_ids),
+        "num_layers": len(moe_ids),
+        "num_experts": architecture.num_experts,
+        "num_blocks": num_blocks,
+        "channel_block_size": block_size,
+        "intermediate_size": architecture.intermediate_size,
+        "allocation_scope": "per_layer_expert_ahsp_risk_curve",
+        "allocation_objective": "minimize_sum_expert_structural_fragility_times_normalized_channel_tail_risk",
+        "target_blocks_by_layer": [target_blocks] * len(moe_ids),
+        "actual_blocks_by_layer": widths.sum(dim=1).tolist(),
+        "total_blocks": total_blocks,
+        "maximum_blocks": int(widths.numel() * num_blocks),
+        "target_pruning_ratio": 1.0 - budget_width / architecture.intermediate_size,
+        "actual_structural_pruning_ratio": 1.0 - budget_width / architecture.intermediate_size,
+        "retained_channels": None,
+        "budget_reference_width": int(budget_width),
+        "width_options": [int(min_width), int(budget_width), int(max_width)],
+        "padded_intermediate_size": int(max_width),
+        "retained_expert_mask": None,
+        "profile_widths": widths,
+        "profile_sha256": hashlib.sha256(widths.numpy().tobytes(order="C")).hexdigest(),
+        "csp": {
+            "data_free": True,
+            "weight_only": True,
+            "accumulator_dtype": "float32",
+            "input_scale_mode": "none",
+            "canonicalization": False,
+            "architecture": adapter.metadata(),
+            "ahsp": {
+                "expert_score": "exp(log(N_E * ||Theta_e||_2^2 / ||Theta_e||_1^2))",
+                "channel_score": "exp(log(N_C * ||theta_ec||_2^2 / ||theta_ec||_1^2))",
+                "risk_curve": "expert_score * normalized_channel_tail_mass",
+                "allocation": "greedy_marginal_risk_reduction_with_hsp_safeguard",
+                "min_width": int(min_width),
+                "budget_width": int(budget_width),
+                "max_width": int(max_width),
+                "risk_curves_by_layer": risk_by_layer,
+                "hsp_widths_by_layer": hsp_widths.tolist(),
+                "csp_widths_by_layer": csp_widths.tolist(),
+            },
+        },
+    }
+    validate_static_profile_payload(profile)
+    return profile
+
+
 def write_profile(profile: dict[str, Any], profile_path: Path) -> None:
     profile_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(profile, profile_path)
@@ -430,6 +555,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--retained-channels", type=int)
     parser.add_argument("--heterogeneous-widths", type=int, nargs="+")
     parser.add_argument("--budget-width", type=int)
+    parser.add_argument("--ahsp", action="store_true", help="Build an Adaptive HSP risk-curve profile.")
+    parser.add_argument("--ahsp-min-width", type=int)
+    parser.add_argument("--ahsp-max-width", type=int)
     parser.add_argument("--rounding", choices=("floor", "nearest", "ceil"), default="nearest")
     parser.add_argument("--apply-input-scale", choices=("auto", "always", "never"), default="auto")
     parser.add_argument(
@@ -441,8 +569,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    heterogeneous = args.heterogeneous_widths is not None or args.budget_width is not None
-    if heterogeneous:
+    if args.ahsp and (args.heterogeneous_widths is not None or args.retained_channels is not None or args.target_pruning_ratio is not None):
+        raise ValueError("AHSP cannot be combined with HSP-Hetero or a uniform width.")
+    if args.ahsp and (args.ahsp_min_width is None or args.ahsp_max_width is None or args.budget_width is None):
+        raise ValueError("AHSP requires --ahsp-min-width, --budget-width, and --ahsp-max-width.")
+    heterogeneous = not args.ahsp and (args.heterogeneous_widths is not None or args.budget_width is not None)
+    if args.ahsp:
+        heterogeneous = False
+    elif heterogeneous:
         if args.heterogeneous_widths is None or args.budget_width is None:
             raise ValueError("Provide both --heterogeneous-widths and --budget-width.")
         if args.retained_channels is not None or args.target_pruning_ratio is not None:
@@ -458,17 +592,20 @@ def main() -> int:
         args.apply_input_scale == "auto" and adapter.architecture.model_family == "gemma4"
     )
     canonicalize = bool(args.canonicalize)
-    heterogeneous = args.heterogeneous_widths is not None or args.budget_width is not None
-    if heterogeneous and apply_input_scale:
+    heterogeneous = not args.ahsp and (args.heterogeneous_widths is not None or args.budget_width is not None)
+    if (heterogeneous or args.ahsp) and apply_input_scale:
         if args.apply_input_scale == "always":
-            raise ValueError("HSP-Hetero uses raw parameter signatures and does not support input scaling.")
+            raise ValueError("HSP-Hetero and AHSP use raw parameter signatures and do not support input scaling.")
         apply_input_scale = False
     if apply_input_scale and adapter.input_scale_template is None:
         if args.apply_input_scale == "always":
             raise ValueError(f"{adapter.architecture.model_family} has no supported expert input scale.")
         apply_input_scale = False
     architecture = adapter.architecture
-    if heterogeneous:
+    if args.ahsp:
+        retained_channels = None
+        target_ratio = 1.0 - int(args.budget_width) / architecture.intermediate_size
+    elif heterogeneous:
         retained_channels = None
         target_ratio = 1.0 - int(args.budget_width) / architecture.intermediate_size
     elif args.retained_channels is not None:
@@ -497,7 +634,18 @@ def main() -> int:
         )
         channel_path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(channel, channel_path)
-    if heterogeneous:
+    if args.ahsp:
+        profile = build_ahsp_profile(
+            model_path=model_path,
+            adapter=adapter,
+            tables=channel["table"],
+            budget_width=int(args.budget_width),
+            min_width=int(args.ahsp_min_width),
+            max_width=int(args.ahsp_max_width),
+            apply_input_scale=apply_input_scale,
+            canonicalize=canonicalize,
+        )
+    elif heterogeneous:
         profile = build_heterogeneous_profile(
             model_path=model_path,
             adapter=adapter,
@@ -519,6 +667,8 @@ def main() -> int:
     profile["cache_provenance"] = {"channel": {"path": str(channel_path), "sha256": file_sha256(channel_path), "role": "csp_ranking"}}
     write_profile(profile, profile_path)
     retained_name = (
+        f"ahsp_retained_budget{args.budget_width}ch.json"
+        if args.ahsp else
         f"csp_retained_heterogeneous_budget{args.budget_width}ch.json"
         if heterogeneous else f"csp_retained_{retained_channels}ch.json"
     )

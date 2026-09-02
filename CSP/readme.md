@@ -207,6 +207,53 @@ Gemma4=`288/352/416`、DeepSeek-V2-Lite=`640/704/768`、OLMoE=`448/512/576`、Mi
 `CSP_HETEROGENEOUS_WIDTHS` 与 `CSP_BUDGET_WIDTH` 传入。标准 HF/vLLM 导出统一
 zero-pad 到高档物理宽度，不能据此宣称已经获得真实异构 kernel 加速。
 
+## 6.1 Adaptive HSP（AHSP）
+
+AHSP 是 HSP 的自适应升级版，保留现有 CSP/HSP 的入口和 profile 格式，不改变
+旧方法的默认行为。AHSP 不再仅根据 Expert-SP 的排序分配三档固定宽度，而是为
+每个 expert 建立 compression risk curve。
+
+对 expert $e$，先计算 Expert-SP；对其 channel 按 Channel-SP 降序排列并形成
+aligned blocks。保留前 $n$ 个 block 时，channel tail risk 为：
+
+$$
+R^C_e(n)=1-
+\frac{\sum_{j=1}^{n}\exp(S^C_{e,j})}
+{\sum_{j=1}^{M}\exp(S^C_{e,j})}.
+$$
+
+AHSP 将 expert 的 structural fragility 作为权重：
+
+$$
+R_e(n)=
+\frac{\exp(S^E_e)}{\operatorname{mean}_e[\exp(S^E_e)]}R^C_e(n).
+$$
+
+随后从最小允许宽度开始，反复把一个 block 分配给能获得最大边际风险下降的
+expert，直到达到每层固定总预算。候选分配同时包含 AHSP greedy allocation、旧
+HSP 的 25/50/25 分位数分配和等宽 CSP 分配。三者使用同一个 risk objective 比较，
+最终选择 residual risk 最小者；因此 risk curve 不支持自适应分配时可以退化为
+旧 HSP 或 CSP。
+
+AHSP 使用模型参数，不需要 calibration、forward、activation、gradient、router
+statistics 或下游指标。每个 expert 的最终 channel 仍取 Channel-SP 排序的前
+$K_e$ 个，并同步裁剪 gate/up 行和 down 列。packed 模型的 gate/up 两个半区分别
+padding 后再拼接，以保持 HF/vLLM 的物理布局。
+
+示例（Qwen3）：
+
+```bash
+python -m CSP.build_csp_artifacts \
+  --model-path /path/to/Qwen3-30B-A3B-Instruct-2507 \
+  --output-channel-cache /path/to/ahsp/csp_rankings.pt \
+  --output-profile /path/to/ahsp/ahsp_profile.pt \
+  --ahsp --ahsp-min-width 320 --budget-width 384 --ahsp-max-width 448
+```
+
+AHSP profile 可直接交给现有 `CSP.export_csp_checkpoint` 导出；旧的 uniform CSP
+和 HSP-Hetero 命令保持不变。当前 risk curve 是结构性 proxy，是否优于 HSP 仍需
+通过独立的 loss/accuracy 实验验证。
+
 ## 7. 理论边界
 
 严格成立的性质包括：function-equivalence、minimum-energy canonical gauge、

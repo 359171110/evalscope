@@ -7,6 +7,8 @@ from CSP.csp_core import (
     canonical_structural_score,
     canonical_structural_score_packed,
     allocate_participation_widths,
+    ahsp_risk_curve,
+    allocate_ahsp_widths,
     participation_block_spectrum,
     rank_channels_by_csp,
     ranking_table,
@@ -136,3 +138,16 @@ def test_participation_allocator_rejects_non_aligned_or_impossible_options() -> 
         allocate_participation_widths(spectrum, candidate_widths=(1, 2), total_blocks=3, block_size=2)
     with pytest.raises(ValueError, match="exactly representable"):
         allocate_participation_widths(spectrum, candidate_widths=(1, 3), total_blocks=3)
+
+
+def test_ahsp_risk_curve_and_allocator_keep_exact_budget() -> None:
+    channels = torch.tensor([[4.0, 3.0, 2.0, 1.0], [1.0, 1.0, 1.0, 1.0]])
+    curves = ahsp_risk_curve(channels, torch.tensor([2.0, 1.0]))
+    assert curves.shape == (2, 5)
+    assert torch.all(curves[:, :-1] >= curves[:, 1:])
+    widths = allocate_ahsp_widths(
+        curves.unsqueeze(0), total_blocks=4, min_blocks=1, max_blocks=3,
+    )
+    assert widths.shape == (1, 2)
+    assert widths.sum().item() == 4
+    assert bool(((widths >= 1) & (widths <= 3)).all())
