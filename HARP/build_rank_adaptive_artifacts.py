@@ -13,7 +13,7 @@ import torch
 from CSP.csp_core import file_sha256
 from CSP.model_adapter import CSPModelAdapter
 from CSP.build_csp_artifacts_impl import load_weight_map
-from HARP.rank_adaptive_core import allocate_rank_adaptive_widths
+from HARP.rank_adaptive_core import allocate_v2_rank_adaptive_widths
 from static_moe_prunning.code.src.static_expert_pruning import validate_static_profile_payload
 
 
@@ -25,11 +25,12 @@ def build_profile(
     low_width: int,
     budget_width: int,
     high_width: int,
-    layer_step_fraction: float = 0.25,
+    gamma: float = 2.0,
+    min_fraction: float = 0.15,
     relative_noise: float = 0.005,
     repeats: int = 32,
 ) -> dict[str, Any]:
-    """Build and save an independent HARP-RankAdaptive profile."""
+    """Build and save an independent HARP-v2-RankAdaptive profile."""
 
     model = model_path.expanduser().resolve()
     cache_path = channel_cache.expanduser().resolve()
@@ -61,13 +62,14 @@ def build_profile(
     layer_scores = torch.tensor(cache["layer_scores"], dtype=torch.float64)
     expert_scores = [cache["table"][int(layer_id)]["expert_structural_scores"].to(dtype=torch.float64)
                      for layer_id in layer_ids]
-    logical_widths, diagnostics = allocate_rank_adaptive_widths(
+    logical_widths, diagnostics = allocate_v2_rank_adaptive_widths(
         layer_scores,
         expert_scores,
         low_width=low_width,
         mid_width=budget_width,
         high_width=high_width,
-        layer_step_fraction=layer_step_fraction,
+        gamma=gamma,
+        min_fraction=min_fraction,
         relative_noise=relative_noise,
         repeats=repeats,
     )
@@ -79,7 +81,7 @@ def build_profile(
     profile: dict[str, Any] = {
         "schema_version": 1,
         "method": "harp",
-        "mode": "harp_rank_adaptive_layer_expert_channel_sp",
+        "mode": "harp_v2_rank_adaptive_layer_expert_channel_sp",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "model_path": str(model),
         "model_family": architecture.model_family,
@@ -95,7 +97,7 @@ def build_profile(
         "intermediate_size": architecture.intermediate_size,
         "allocation_scope": "per_layer_expert_harp_layer_expert_channel_sp",
         "allocation_objective": (
-            "bounded_layer_rank_budget_then_adaptive_expert_head_tiers_then_channel_sp_prefix"
+            "harp_v2_layer_sp_waterfill_then_expert_sp_combo_search_then_channel_sp_prefix"
         ),
         "target_blocks_by_layer": profile_widths.sum(dim=1).tolist(),
         "actual_blocks_by_layer": profile_widths.sum(dim=1).tolist(),
@@ -118,7 +120,7 @@ def build_profile(
             "canonicalization": False,
             "architecture": adapter.metadata(),
             "harp": {
-                "allocator": "rank_adaptive",
+                "allocator": "v2_rank_adaptive",
                 "layer_scores": [float(value) for value in layer_scores.tolist()],
                 "low_width": low_width,
                 "budget_width": budget_width,
@@ -149,7 +151,8 @@ def main() -> int:
     parser.add_argument("--low-width", type=int, required=True)
     parser.add_argument("--budget-width", type=int, required=True)
     parser.add_argument("--high-width", type=int, required=True)
-    parser.add_argument("--layer-step-fraction", type=float, default=0.25)
+    parser.add_argument("--gamma", type=float, default=2.0)
+    parser.add_argument("--min-fraction", type=float, default=0.15)
     parser.add_argument("--relative-noise", type=float, default=0.005)
     parser.add_argument("--repeats", type=int, default=32)
     args = parser.parse_args()
@@ -160,7 +163,8 @@ def main() -> int:
         low_width=args.low_width,
         budget_width=args.budget_width,
         high_width=args.high_width,
-        layer_step_fraction=args.layer_step_fraction,
+        gamma=args.gamma,
+        min_fraction=args.min_fraction,
         relative_noise=args.relative_noise,
         repeats=args.repeats,
     )

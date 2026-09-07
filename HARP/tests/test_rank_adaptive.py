@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import torch
 
+from HARP.harp_core import allocate_combo_expert_widths
 from HARP.rank_adaptive_core import (
     allocate_expert_tiers,
     allocate_layer_rank_units,
     allocate_rank_adaptive_widths,
+    allocate_v2_rank_adaptive_widths,
     detect_stable_expert_head,
 )
 
@@ -51,3 +53,54 @@ def test_rank_adaptive_widths_preserve_global_budget() -> None:
     assert int(widths.sum()) == 5 * 8 * 128
     assert diagnostics["budget_error"] == 0
     assert set(int(value) for value in widths.reshape(-1).tolist()) <= {64, 128, 192}
+
+
+def test_v2_rank_adaptive_preserves_combo_base_and_adds_minimal_closure() -> None:
+    layer_scores = torch.tensor([0.8, 0.6, 0.5, 0.4], dtype=torch.float64)
+    expert_scores = [torch.linspace(1.0 + row, 0.5 + row, 16) for row in range(4)]
+    expected, _ = allocate_combo_expert_widths(
+        layer_scores,
+        expert_scores,
+        low_width=64,
+        mid_width=128,
+        high_width=192,
+        global_avg_width=128.0,
+        gamma=2.0,
+        min_fraction=0.15,
+        allow_mid=True,
+    )
+    actual, diagnostics = allocate_v2_rank_adaptive_widths(
+        layer_scores,
+        expert_scores,
+        low_width=64,
+        mid_width=128,
+        high_width=192,
+        gamma=2.0,
+        min_fraction=0.15,
+        repeats=8,
+    )
+    delta = actual - expected
+    assert bool(((delta == 0) | (delta == 64)).all())
+    assert int(delta.sum().item()) == diagnostics["budget_closure"]["missing_width_before"]
+    assert int(actual.sum().item()) == 4 * 16 * 128
+    assert diagnostics["allocator"] == "v2_rank_adaptive"
+    assert diagnostics["base_allocator"] == "combo"
+    assert all(layer["head_used_as_high_count"] is False for layer in diagnostics["layers"])
+
+
+def test_v2_rank_adaptive_closes_budget_after_layer_target_clipping() -> None:
+    layer_scores = torch.tensor([2.0] + [0.5] * 7, dtype=torch.float64)
+    expert_scores = [torch.linspace(1.0, 0.5, 16) for _ in range(8)]
+    widths, diagnostics = allocate_v2_rank_adaptive_widths(
+        layer_scores,
+        expert_scores,
+        low_width=64,
+        mid_width=128,
+        high_width=192,
+        gamma=2.0,
+        min_fraction=0.15,
+        repeats=8,
+    )
+    assert int(widths.sum().item()) == 8 * 16 * 128
+    assert diagnostics["leftover_final"] == 0.0
+    assert abs(sum(diagnostics["layer_target_widths"]) - 8 * 128) < 1.0e-6

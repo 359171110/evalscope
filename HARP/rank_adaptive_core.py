@@ -7,6 +7,11 @@ from typing import Any
 
 import torch
 
+from HARP.harp_core import (
+    assign_expert_tier_widths,
+    layer_sp_weighted_targets,
+    search_expert_tier_counts,
+)
 from HARP.rank_analysis_core import one_change_point, perturb_scores
 
 
@@ -245,3 +250,201 @@ def allocate_rank_adaptive_widths(
         "budget_error": actual_total - target_total,
     }
     return widths, diagnostics
+
+
+def allocate_v2_rank_adaptive_widths(
+    layer_scores: torch.Tensor,
+    expert_scores_by_layer: list[torch.Tensor],
+    *,
+    low_width: int,
+    mid_width: int,
+    high_width: int,
+    gamma: float = 2.0,
+    min_fraction: float = 0.15,
+    relative_noise: float = 0.005,
+    repeats: int = 32,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Allocate widths with HARP-v2 combo search plus rank diagnostics.
+
+    Layer-SP water-fill and Expert-SP tier search are intentionally delegated to
+    the validated HARP-v2 implementation. RankAdaptive contributes diagnostics
+    and interpretation, but never converts a change-point rank into n_high.
+    """
+
+    if layer_scores.ndim != 1 or layer_scores.numel() == 0:
+        raise ValueError("layer_scores must be a non-empty vector.")
+    if not bool(torch.isfinite(layer_scores).all()):
+        raise ValueError("layer_scores must be finite.")
+    layers = int(layer_scores.numel())
+    if len(expert_scores_by_layer) != layers:
+        raise ValueError("expert_scores_by_layer must match layer_scores.")
+    experts = int(expert_scores_by_layer[0].numel())
+    if any(int(scores.numel()) != experts for scores in expert_scores_by_layer):
+        raise ValueError("All layers must contain the same number of experts.")
+    initial_targets = layer_sp_weighted_targets(
+        layer_scores,
+        low_width=int(low_width),
+        global_avg_width=float(mid_width),
+        high_width=int(high_width),
+        gamma=float(gamma),
+    )
+    targets = _project_bounded_targets(
+        initial_targets,
+        target_sum=float(layers * int(mid_width)),
+        lower=float(low_width),
+        upper=float(high_width),
+    )
+    budgets = (targets * experts).tolist()
+    order = torch.argsort(layer_scores, descending=True, stable=True)
+    ranks = torch.empty_like(order)
+    ranks.scatter_(0, order, torch.arange(1, layers + 1, dtype=torch.long))
+    widths = torch.zeros((layers, experts), dtype=torch.long)
+    actual = [0.0] * layers
+    counts: list[list[int]] = [[0, 0, 0] for _ in range(layers)]
+    remainder = 0.0
+    for row in order.tolist():
+        available = float(budgets[row]) + remainder
+        n_high, n_mid, n_low = search_expert_tier_counts(
+            available,
+            experts,
+            int(low_width),
+            int(mid_width),
+            int(high_width),
+            min_fraction=float(min_fraction),
+            allow_mid=True,
+        )
+        layer_widths = assign_expert_tier_widths(
+            expert_scores_by_layer[row],
+            n_high,
+            n_mid,
+            int(low_width),
+            int(mid_width),
+            int(high_width),
+        )
+        used = float(layer_widths.sum().item())
+        widths[row] = layer_widths
+        actual[row] = used
+        counts[row] = [n_high, n_mid, n_low]
+        remainder = available - used
+    widths, closure = _close_discrete_budget(
+        widths,
+        layer_scores,
+        expert_scores_by_layer,
+        target_total=layers * experts * int(mid_width),
+        tier_gap=int(mid_width) - int(low_width),
+        high_width=int(high_width),
+    )
+    actual = [float(widths[row].sum().item()) for row in range(layers)]
+    counts = [[
+        int((widths[row] == int(high_width)).sum().item()),
+        int((widths[row] == int(mid_width)).sum().item()),
+        int((widths[row] == int(low_width)).sum().item()),
+    ] for row in range(layers)]
+    diagnostics_layers: list[dict[str, Any]] = []
+    for row, expert_scores in enumerate(expert_scores_by_layer):
+        head = detect_stable_expert_head(
+            expert_scores,
+            relative_noise=relative_noise,
+            repeats=repeats,
+            seed=row,
+        )
+        tier_counts = counts[row]
+        diagnostics_layers.append({
+            "row": row,
+            "layer_rank": int(ranks[row].item()),
+            "layer_score": float(layer_scores[row].item()),
+            "layer_target_width_initial": float(initial_targets[row].item()),
+            "layer_target_width": float(targets[row].item()),
+            "layer_budget_init": float(budgets[row]),
+            "layer_budget_actual": float(actual[row]),
+            "n_high": int(tier_counts[0]),
+            "n_mid": int(tier_counts[1]),
+            "n_low": int(tier_counts[2]),
+            "head": head,
+            "head_used_as_high_count": False,
+        })
+    diagnostics = {
+        "allocator": "v2_rank_adaptive",
+        "base_allocator": "combo",
+        "gamma": float(gamma),
+        "min_fraction": float(min_fraction),
+        "relative_noise": float(relative_noise),
+        "head_stability_repeats": int(repeats),
+        "layer_order_descending": [int(value) for value in order.tolist()],
+        "layers": diagnostics_layers,
+        "layer_target_widths_initial": [float(value) for value in initial_targets.tolist()],
+        "layer_target_widths": [float(value) for value in targets.tolist()],
+        "layer_budget_init": [float(value) for value in budgets],
+        "layer_budget_actual": actual,
+        "expert_tier_counts_by_layer": counts,
+        "leftover_before_closure": float(remainder),
+        "leftover_final": 0.0,
+        "budget_closure": closure,
+    }
+    return widths, diagnostics
+
+
+def _project_bounded_targets(
+    targets: torch.Tensor,
+    *,
+    target_sum: float,
+    lower: float,
+    upper: float,
+) -> torch.Tensor:
+    """Shift clipped layer targets to an exact bounded global sum."""
+
+    projected = targets.to(dtype=torch.float64).clamp(min=lower, max=upper).clone()
+    for _ in range(int(projected.numel()) + 1):
+        residual = float(target_sum - projected.sum().item())
+        if abs(residual) <= 1.0e-9:
+            return projected
+        movable = projected < upper - 1.0e-12 if residual > 0.0 else projected > lower + 1.0e-12
+        count = int(movable.sum().item())
+        if count == 0:
+            break
+        projected[movable] += residual / count
+        projected.clamp_(min=lower, max=upper)
+    if abs(float(projected.sum().item()) - target_sum) > 1.0e-6:
+        raise RuntimeError("Unable to project Layer-SP targets onto the exact bounded budget.")
+    return projected
+
+
+def _close_discrete_budget(
+    widths: torch.Tensor,
+    layer_scores: torch.Tensor,
+    expert_scores_by_layer: list[torch.Tensor],
+    *,
+    target_total: int,
+    tier_gap: int,
+    high_width: int,
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Close the remaining aligned budget with rank-ordered tier upgrades."""
+
+    result = widths.clone()
+    missing = int(target_total) - int(result.sum().item())
+    if missing < 0 or tier_gap <= 0 or missing % tier_gap:
+        raise RuntimeError("Discrete RankAdaptive budget error is not an aligned nonnegative gap.")
+    upgrades = missing // tier_gap
+    candidates: list[tuple[int, int, int, int]] = []
+    layer_order = torch.argsort(layer_scores, descending=True, stable=True).tolist()
+    layer_rank = {layer: rank for rank, layer in enumerate(layer_order)}
+    for layer, scores in enumerate(expert_scores_by_layer):
+        expert_order = torch.argsort(scores, descending=True, stable=True).tolist()
+        expert_rank = {expert: rank for rank, expert in enumerate(expert_order)}
+        for expert in range(int(result.shape[1])):
+            if int(result[layer, expert]) < int(high_width):
+                candidates.append((layer_rank[layer], expert_rank[expert], layer, expert))
+    candidates.sort()
+    if upgrades > len(candidates):
+        raise RuntimeError("Not enough expert tiers to close the global budget.")
+    touched: list[list[int]] = []
+    for _, _, layer, expert in candidates[:upgrades]:
+        result[layer, expert] += int(tier_gap)
+        touched.append([int(layer), int(expert)])
+    if int(result.sum().item()) != int(target_total):
+        raise RuntimeError("RankAdaptive discrete budget closure failed.")
+    return result, {
+        "missing_width_before": missing,
+        "tier_upgrades": upgrades,
+        "touched_layer_experts": touched,
+    }
