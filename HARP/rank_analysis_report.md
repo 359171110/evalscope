@@ -1,4 +1,221 @@
-# HARP rank-structure analysis
+# HARP rank 核心问题
+
+只回答三件事：有没有稳定 head、特殊对象是不是由下层少数对象驱动、HARP 该怎么用。
+2σ / z-score 只作辅助。Channel 分段只在前 25% rank 里找 head，DeepSeek 的 tail split 不计。
+消融按原始公式重算上一级 SP：`S=log(N ||Θ||_2^2 / ||Θ||_1^2)`，不是剩余分数的均值。
+扰动：每个序列 32 次、相对噪声 0.5%；稳定 = 分界位移 ≤ 2 的比例 ≥ 75%。
+
+## 1. 三层 rank 的核心分段
+
+### Qwen3
+
+| 层级 | 是否有自然分段 | 分界 rank | 分界前后差异 | 扰动后是否稳定 |
+|---|---|---:|---:|---|
+| Layer | 有弱分段但不稳定 | 3 | d=2.737 | 是（within_two=1.000） |
+| Expert | 有稳定 head | 7 （29/48 层有 head） | d=3.005 | 是 （mean within_two=0.978） |
+| Channel | 有弱分段但不稳定 | 39 （2926/6144 expert 有 head） | d=2.983；d@10%=2.284 | 是（pooled within_two=1.000） |
+
+### Gemma4
+
+| 层级 | 是否有自然分段 | 分界 rank | 分界前后差异 | 扰动后是否稳定 |
+|---|---|---:|---:|---|
+| Layer | 有弱分段但不稳定 | 2 | d=2.620 | 是（within_two=1.000） |
+| Expert | 有稳定 head | 7 （18/30 层有 head） | d=2.895 | 是 （mean within_two=0.954） |
+| Channel | 有稳定 head | 36 （2196/3840 expert 有 head） | d=3.062；d@10%=2.342 | 是（pooled within_two=1.000） |
+
+### Qwen3.6
+
+| 层级 | 是否有自然分段 | 分界 rank | 分界前后差异 | 扰动后是否稳定 |
+|---|---|---:|---:|---|
+| Layer | 有弱分段但不稳定 | 2 | d=3.286 | 是（within_two=1.000） |
+| Expert | 有稳定 head | 13 （25/40 层有 head） | d=2.775 | 是 （mean within_two=0.913） |
+| Channel | 有弱分段但不稳定 | 26 （4515/10240 expert 有 head） | d=2.752；d@10%=1.106 | 是（pooled within_two=1.000） |
+
+### DeepSeek
+
+| 层级 | 是否有自然分段 | 分界 rank | 分界前后差异 | 扰动后是否稳定 |
+|---|---|---:|---:|---|
+| Layer | 有稳定 head | 4 | d=2.273 | 是（within_two=1.000） |
+| Expert | 有弱分段但不稳定 | 4 （16/26 层有 head） | d=2.562 | 是 （mean within_two=0.820） |
+| Channel | 有弱分段但不稳定 | 71 （634/1664 expert 有 head） | d=2.626；d@10%=2.143 | 是（pooled within_two=1.000） |
+
+### OLMoE
+
+| 层级 | 是否有自然分段 | 分界 rank | 分界前后差异 | 扰动后是否稳定 |
+|---|---|---:|---:|---|
+| Layer | 有弱分段但不稳定 | 4 | d=1.684 | 是（within_two=1.000） |
+| Expert | 有弱分段但不稳定 | 5 （10/16 层有 head） | d=2.549 | 是 （mean within_two=0.822） |
+| Channel | 有稳定 head | 52 （626/1024 expert 有 head） | d=3.331；d@10%=0.053 | 是（pooled within_two=1.000） |
+
+## 2. 特殊对象
+
+定义：`候选特殊对象 = rank head（top 10%）+ 明显 gap/change point`。没有 gap 时表中仍列出 top rank，但不把它当成可保护的特殊对象。
+
+| Model | Special layers | Special experts | Special channels |
+|---|---|---|---|
+| Qwen3 | L0, L47, L37, L41, L25（弱分段 k=3；Layer 0 outlier；top10%=L0, L47, L37, L41, L25） | L0 top10% n=13（有额外 head gap，稳定，k=10）；L47 top10% n=13（有额外 head gap，稳定，k=7）；L37 top10% n=13（无额外 head gap，稳定，k=7）；L41 top10% n=13（有额外 head gap，稳定，k=7）；L25 top10% n=13（有额外 head gap，稳定，k=7） | 每个 expert 的 top 10% prefix；head gap 比例 2926/6144；top10% 平均 participation mass=0.110 |
+| Gemma4 | L0, L17, L16（仅端点尖峰；Layer 0 outlier；top10%=L0, L17, L16） | L0 top10% n=13（有额外 head gap，稳定，k=19）；L17 top10% n=13（有额外 head gap，稳定，k=7）；L16 top10% n=13（无额外 head gap，稳定，k=7） | 每个 expert 的 top 10% prefix；head gap 比例 2196/3840；top10% 平均 participation mass=0.113 |
+| Qwen3.6 | L0, L39, L33, L32（仅端点尖峰；Layer 0 outlier；top10%=L0, L39, L33, L32） | L0 top10% n=26（有额外 head gap，稳定，k=13）；L39 top10% n=26（有额外 head gap，稳定，k=13）；L33 top10% n=26（有额外 head gap，稳定，k=13）；L32 top10% n=26（有额外 head gap，稳定，k=13） | 每个 expert 的 top 10% prefix；head gap 比例 4515/10240；top10% 平均 participation mass=0.109 |
+| DeepSeek | L11, L10, L8（有明显 gap；top10%=L11, L10, L8） | L11 top10% n=7（有额外 head gap，稳定，k=5）；L10 top10% n=7（有额外 head gap，不稳定，k=4）；L8 top10% n=7（无额外 head gap，稳定，k=4） | 每个 expert 的 top 10% prefix；head gap 比例 634/1664；top10% 平均 participation mass=0.105 |
+| OLMoE | L8, L9（弱分段 k=4；top10%=L8, L9） | L8 top10% n=7（有额外 head gap，不稳定，k=7）；L9 top10% n=7（有额外 head gap，稳定，k=5） | 每个 expert 的 top 10% prefix；head gap 比例 626/1024；top10% 平均 participation mass=0.114 |
+
+## 3. 层级归因（重算 SP）
+
+### 3.1 Channel → Expert
+
+对每个候选特殊 layer 的 top 10% expert：去掉该 expert 的 top 1%/5%/10% channel 后，用剩余 channel 的 L1/L2 重算 Expert-SP。
+逐 expert 明细在 `core_questions.json`；这里只保留计数和每层最高 Expert-SP 的一行。
+
+| Model | n | channel-driven | mixed | distributed-channel |
+|---|---:|---:|---:|---:|
+| Qwen3 | 65 | 36 | 23 | 6 |
+| Gemma4 | 39 | 20 | 11 | 8 |
+| Qwen3.6 | 104 | 33 | 39 | 32 |
+| DeepSeek | 21 | 17 | 4 | 0 |
+| OLMoE | 14 | 14 | 0 | 0 |
+
+#### Qwen3
+
+| Expert | 原 Expert-SP | 去 top 1% channel | 去 top 5% | 去 top 10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L0E35（层内最高） | 1.0468 | 1.0386 (r1) | 1.0210 (r3) | 0.9996 (r4) | distributed-channel |
+| L47E2（层内最高） | 0.5348 | 0.5204 (r2) | 0.4935 (r18) | 0.4834 (r38) | channel-driven |
+| L37E62（层内最高） | 0.5513 | 0.5476 (r1) | 0.5417 (r1) | 0.5318 (r3) | mixed |
+| L41E42（层内最高） | 0.5654 | 0.5596 (r1) | 0.5439 (r1) | 0.5310 (r3) | channel-driven |
+| L25E61（层内最高） | 0.5335 | 0.5256 (r1) | 0.5051 (r5) | 0.4950 (r10) | channel-driven |
+
+汇总：channel-driven
+
+#### Gemma4
+
+| Expert | 原 Expert-SP | 去 top 1% channel | 去 top 5% | 去 top 10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L0E115（层内最高） | 0.6644 | 0.6615 (r1) | 0.6553 (r1) | 0.6495 (r2) | distributed-channel |
+| L17E106（层内最高） | 0.6190 | 0.6124 (r1) | 0.5950 (r1) | 0.5829 (r2) | channel-driven |
+| L16E93（层内最高） | 0.5840 | 0.5796 (r2) | 0.5661 (r3) | 0.5515 (r13) | channel-driven |
+
+汇总：channel-driven
+
+#### Qwen3.6
+
+| Expert | 原 Expert-SP | 去 top 1% channel | 去 top 5% | 去 top 10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L0E25（层内最高） | 2.2084 | 2.2518 (r1) | 2.4671 (r1) | 2.9001 (r1) | distributed-channel |
+| L39E200（层内最高） | 0.7769 | 0.7729 (r1) | 0.7780 (r1) | 0.7919 (r1) | distributed-channel |
+| L33E75（层内最高） | 0.6058 | 0.6027 (r1) | 0.5954 (r1) | 0.5893 (r1) | mixed |
+| L32E123（层内最高） | 0.5913 | 0.5877 (r1) | 0.5838 (r1) | 0.5794 (r1) | mixed |
+
+汇总：mixed
+
+#### DeepSeek
+
+| Expert | 原 Expert-SP | 去 top 1% channel | 去 top 5% | 去 top 10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L11E49（层内最高） | 0.4864 | 0.4850 (r1) | 0.4795 (r1) | 0.4767 (r1) | channel-driven |
+| L10E33（层内最高） | 0.4714 | 0.4706 (r1) | 0.4694 (r4) | 0.4684 (r5) | mixed |
+| L8E10（层内最高） | 0.4733 | 0.4710 (r2) | 0.4678 (r10) | 0.4652 (r18) | channel-driven |
+
+汇总：channel-driven
+
+#### OLMoE
+
+| Expert | 原 Expert-SP | 去 top 1% channel | 去 top 5% | 去 top 10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L8E10（层内最高） | 0.5009 | 0.4925 (r7) | 0.4784 (r34) | 0.4731 (r44) | channel-driven |
+| L9E21（层内最高） | 0.5113 | 0.5029 (r3) | 0.4843 (r12) | 0.4761 (r31) | channel-driven |
+
+汇总：channel-driven
+
+### 3.2 Expert → Layer
+
+对每个候选特殊 layer：去掉 top-1 / top 5% / top 10% expert 后，用剩余 expert 权重的 L1/L2 重算 Layer-SP。
+
+#### Qwen3
+
+| Layer | 原 Layer-SP | 去 top-1 expert | 去 top-5% | 去 top-10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L0 | 0.5544 | 0.5513 | 0.5339 | 0.5206 | distributed |
+| L47 | 0.4794 | 0.4789 | 0.4770 | 0.4758 | not-outlier |
+| L37 | 0.4780 | 0.4775 | 0.4754 | 0.4740 | not-outlier |
+| L41 | 0.4775 | 0.4769 | 0.4748 | 0.4736 | not-outlier |
+| L25 | 0.4754 | 0.4750 | 0.4733 | 0.4723 | not-outlier |
+
+汇总：distributed
+
+#### Gemma4
+
+| Layer | 原 Layer-SP | 去 top-1 expert | 去 top-5% | 去 top-10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L0 | 0.5524 | 0.5515 | 0.5471 | 0.5432 | distributed |
+| L17 | 0.5381 | 0.5375 | 0.5357 | 0.5342 | not-outlier |
+| L16 | 0.5300 | 0.5295 | 0.5276 | 0.5261 | not-outlier |
+
+汇总：distributed
+
+#### Qwen3.6
+
+| Layer | 原 Layer-SP | 去 top-1 expert | 去 top-5% | 去 top-10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L0 | 1.0031 | 1.0004 | 0.9780 | 0.9583 | distributed |
+| L39 | 0.4846 | 0.4836 | 0.4801 | 0.4778 | not-outlier |
+| L33 | 0.4816 | 0.4811 | 0.4784 | 0.4766 | not-outlier |
+| L32 | 0.4807 | 0.4803 | 0.4781 | 0.4765 | not-outlier |
+
+汇总：distributed
+
+#### DeepSeek
+
+| Layer | 原 Layer-SP | 去 top-1 expert | 去 top-5% | 去 top-10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L11 | 0.4658 | 0.4655 | 0.4650 | 0.4647 | distributed |
+| L10 | 0.4641 | 0.4640 | 0.4636 | 0.4632 | not-outlier |
+| L8 | 0.4639 | 0.4637 | 0.4633 | 0.4629 | not-outlier |
+
+汇总：distributed
+
+#### OLMoE
+
+| Layer | 原 Layer-SP | 去 top-1 expert | 去 top-5% | 去 top-10% | 结论 |
+|---|---:|---:|---:|---:|---|
+| L8 | 0.4790 | 0.4786 | 0.4777 | 0.4768 | not-outlier |
+| L9 | 0.4772 | 0.4767 | 0.4753 | 0.4740 | not-outlier |
+
+汇总：distributed
+
+## 核心结论
+
+| Model | Layer rank | Expert rank | Channel rank | Channel→Expert | Expert→Layer | HARP 启发 |
+|---|---|---|---|---|---|---|
+| Qwen3 | 有弱分段但不稳定 | 有稳定 head | 有弱分段但不稳定 | channel-driven | distributed | Layer quantile；Expert 按 rank 分档；Channel 用 top prefix |
+| Gemma4 | 有弱分段但不稳定 | 有稳定 head | 有稳定 head | channel-driven | distributed | Layer quantile；Expert 按 rank 分档；Channel 用 top prefix |
+| Qwen3.6 | 有弱分段但不稳定 | 有稳定 head | 有弱分段但不稳定 | mixed | distributed | Layer quantile；Expert 按 rank 分档；Channel 用 top prefix |
+| DeepSeek | 有稳定 head | 有弱分段但不稳定 | 有弱分段但不稳定 | channel-driven | distributed | Layer quantile；Expert 按 rank 分档；Channel 用 top prefix |
+| OLMoE | 有弱分段但不稳定 | 有弱分段但不稳定 | 有稳定 head | channel-driven | distributed | Layer quantile；Expert 按 rank 分档；Channel 用 top prefix |
+
+### 问题一：rank 中有没有自然分段？
+
+见上表 Layer / Expert / Channel 三列。结论只使用：有稳定 head / 有弱分段但不稳定 / 没有自然分段，只能使用 quantile。
+
+### 问题二：特殊对象是不是由更底层对象造成？
+
+见 Channel→Expert 与 Expert→Layer。Layer 消融只对 2σ 异常层计 majority；其余 top-10% 层标为 `not-outlier`。
+真正的 Layer 异常（Qwen3/Gemma/Qwen3.6 的 L0，DeepSeek 的 L11）在去掉 top 10% expert 后仍然高，属于 distributed layer。
+Channel→Expert 在后段层更容易出现 channel-driven；L0 最高 expert 往往仍是 distributed-channel（Qwen3.6 L0 去掉 top channel 后 Expert-SP 甚至上升）。
+
+### 问题三：HARP 应该怎么利用？
+
+没有一层异常是由少数 expert 撑起来的，因此不把 Layer rank head 做成额外保护预算。
+Expert 层内有更稳定的 head，Channel 有可用的 top prefix，所以：
+
+```text
+Layer：quantile 分配预算
+Expert：按 rank 分档
+Channel：使用 top prefix
+```
+
+---
+
+# 附录：第一轮完整排名分析
 
 Generated from existing `harp_rankings.pt` caches. Scores were not recomputed. The HARP allocator was not changed.
 
