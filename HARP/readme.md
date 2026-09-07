@@ -40,6 +40,16 @@ python -m HARP.build_harp_artifacts \
   --low-width 320 --budget-width 384 --high-width 448
 ```
 
+Combo 迭代（Layer-SP γ 注水 + 层内直接三档搜索，默认不改变 `legacy` 路径）：
+
+```bash
+python -m HARP.build_harp_artifacts ... --allocator combo --gamma 2 --min-fraction 0.15
+python -m HARP.search_combo_five
+python -m HARP.search_combo_two_five
+bash HARP/run_one_model_harp_v2_two_full8.sh qwen3|gemma4|qwen36|deepseek|olmoe GPU PORT
+bash HARP/run_one_model_harp_v2_full8.sh qwen3|gemma4|qwen36|deepseek|olmoe GPU PORT
+```
+
 导出 checkpoint：
 
 ```bash
@@ -50,6 +60,14 @@ python -m HARP.export_harp_checkpoint \
   --channel-cache /path/to/harp/qwen3_channel.pt \
   --output-dir /path/to/harp/qwen3_checkpoint
 ```
+
+full8 评测（50% 然后 25%，CalibrationFree）：
+
+```bash
+bash HARP/run_one_model_harp_full8.sh qwen3|gemma4|qwen36|deepseek|olmoe GPU PORT
+```
+
+三档宽度与 HSP 相同。Layer-SP 决定层预算，Expert-SP 在层内 low-first 升级，Channel-SP 取每个 expert 的 prefix。
 
 ---
 

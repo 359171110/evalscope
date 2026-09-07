@@ -14,7 +14,13 @@ from safetensors import safe_open
 from CSP.build_csp_artifacts_impl import build_layer_rankings, load_weight_map
 from CSP.csp_core import file_sha256
 from CSP.model_adapter import CSPModelAdapter
-from HARP.harp_core import allocate_expert_widths, allocate_layer_upgrade_units, detect_anchor_layer
+from HARP.harp_core import (
+    allocate_combo_expert_widths,
+    allocate_expert_widths,
+    allocate_layer_upgrade_units,
+    allocate_quantile_layer_expert_widths,
+    detect_anchor_layer,
+)
 from static_moe_prunning.code.src.static_expert_pruning import validate_static_profile_payload
 
 
@@ -48,8 +54,26 @@ def whole_layer_score(tensors: dict[str, torch.Tensor]) -> float:
     return float(torch.log(torch.tensor(count * l2 / (l1 * l1), dtype=torch.float64)).item())
 
 
-def build_profile(model_path: Path, output_cache: Path, output_profile: Path, budget_width: int, low_width: int, high_width: int) -> None:
-    """Build and save a HARP profile."""
+def build_profile(
+    model_path: Path,
+    output_cache: Path,
+    output_profile: Path,
+    budget_width: int,
+    low_width: int,
+    high_width: int,
+    *,
+    allocator: str = "legacy",
+    gamma: float = 2.0,
+    min_fraction: float = 0.15,
+) -> None:
+    """Build and save a HARP profile.
+
+    ``allocator='legacy'`` keeps the original round-robin / +2-block upgrade path.
+    ``allocator='combo'`` uses Layer-SP gamma water-fill and direct three-tier search.
+    ``allocator='combo_two'`` is combo with only K_low and K_high (gap 128).
+    ``allocator='quantile_layer'`` assigns High-expert counts from Layer-SP rank
+    quantiles, then Expert-SP two-tier prefixes (gap 128, no mid).
+    """
 
     weight_map = load_weight_map(model_path)
     adapter = CSPModelAdapter.from_checkpoint(model_path, weight_map)
@@ -57,59 +81,129 @@ def build_profile(model_path: Path, output_cache: Path, output_profile: Path, bu
         raise ValueError("HARP requires low_width < budget_width < high_width.")
     for width in (low_width, budget_width, high_width):
         adapter.architecture.validate_width(width)
-    layer_scores: list[float] = []
     layer_ids = adapter.architecture.moe_layer_ids()
-    for layer_id in layer_ids:
-        tensors = load_named(model_path, weight_map, adapter.routed_tensor_names(layer_id))
-        layer_scores.append(whole_layer_score(tensors))
-    channel = build_layer_rankings(model_path, adapter, weight_map, False, False)
     channel_path = output_cache.expanduser().resolve()
     channel_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "schema_version": 1,
-        "purpose": "harp_channel_ranking",
-        "method": "harp",
-        "model_path": str(model_path),
-        "model_family": adapter.architecture.model_family,
-        "model_provenance": {
-            "config_sha256": file_sha256(model_path / "config.json"),
-            "weight_index_sha256": file_sha256(model_path / "model.safetensors.index.json"),
-        },
-        "block_size": adapter.architecture.channel_alignment,
-        "score_mode": "per_expert_structural_participation_aimer_compatible_fp32",
-        "architecture": adapter.metadata(),
-        "table": channel,
-        "layer_scores": layer_scores,
-        "csp": {"data_free": True, "weight_only": True, "input_scale_mode": "none", "canonicalization": False},
-        "harp": {"layer_score": "log(N_layer * ||Theta_layer||_2^2 / ||Theta_layer||_1^2)", "input_scale_mode": "none", "canonicalization": False},
-    }
-    torch.save(payload, channel_path)
+    if channel_path.exists():
+        payload = torch.load(channel_path, map_location="cpu", weights_only=True)
+        if payload.get("purpose") != "harp_channel_ranking":
+            raise ValueError("Existing HARP cache has an unexpected purpose.")
+        if Path(str(payload.get("model_path", ""))).resolve() != model_path:
+            raise ValueError("Existing HARP cache was built for a different model path.")
+        provenance = payload.get("model_provenance", {})
+        if provenance.get("config_sha256") != file_sha256(model_path / "config.json"):
+            raise ValueError("Checkpoint config changed after HARP ranking construction.")
+        if provenance.get("weight_index_sha256") != file_sha256(model_path / "model.safetensors.index.json"):
+            raise ValueError("Checkpoint weight index changed after HARP ranking construction.")
+        channel = payload["table"]
+        layer_scores = [float(score) for score in payload["layer_scores"]]
+    else:
+        layer_scores = []
+        for layer_id in layer_ids:
+            tensors = load_named(model_path, weight_map, adapter.routed_tensor_names(layer_id))
+            layer_scores.append(whole_layer_score(tensors))
+        channel = build_layer_rankings(model_path, adapter, weight_map, False, False)
+        payload = {
+            "schema_version": 1,
+            "purpose": "harp_channel_ranking",
+            "method": "harp",
+            "model_path": str(model_path),
+            "model_family": adapter.architecture.model_family,
+            "model_provenance": {
+                "config_sha256": file_sha256(model_path / "config.json"),
+                "weight_index_sha256": file_sha256(model_path / "model.safetensors.index.json"),
+            },
+            "block_size": adapter.architecture.channel_alignment,
+            "score_mode": "per_expert_structural_participation_aimer_compatible_fp32",
+            "architecture": adapter.metadata(),
+            "table": channel,
+            "layer_scores": layer_scores,
+            "csp": {"data_free": True, "weight_only": True, "input_scale_mode": "none", "canonicalization": False},
+            "harp": {
+                "layer_score": "log(N_layer * ||Theta_layer||_2^2 / ||Theta_layer||_1^2)",
+                "input_scale_mode": "none",
+                "canonicalization": False,
+            },
+        }
+        torch.save(payload, channel_path)
     block = adapter.architecture.channel_alignment
-    low_blocks, budget_blocks, high_blocks = (width // block for width in (low_width, budget_width, high_width))
+    low_blocks, budget_blocks, _high_blocks = (width // block for width in (low_width, budget_width, high_width))
     experts = adapter.architecture.num_experts
     layers = len(layer_ids)
-    total_units = layers * experts * (budget_blocks - low_blocks)
-    anchor = detect_anchor_layer(torch.tensor(layer_scores, dtype=torch.float64))
-    layer_units = allocate_layer_upgrade_units(
-        torch.tensor(layer_scores, dtype=torch.float64),
-        total_units=total_units,
-        max_units_per_layer=2 * experts,
-        anchor_layer=anchor,
-        anchor_min_units=experts if anchor is not None else 0,
-    )
-    widths = []
-    expert_widths = []
-    for row, layer_id in enumerate(layer_ids):
-        table = channel[int(layer_id)]
-        expert_scores = table["expert_structural_scores"]
-        units = int(layer_units[row].item())
-        layer_widths = allocate_expert_widths(expert_scores, low_blocks=low_blocks, target_units=units)
-        widths.append(layer_widths)
-        expert_widths.append(layer_widths.tolist())
-    profile_widths = torch.stack(widths)
+    allocator_name = str(allocator)
+    if allocator_name not in {"legacy", "combo", "combo_two", "quantile_layer"}:
+        raise ValueError("allocator must be 'legacy', 'combo', 'combo_two', or 'quantile_layer'.")
+    if allocator_name in {"combo_two", "quantile_layer"} and high_width - low_width != 128:
+        raise ValueError(f"{allocator_name} requires high_width - low_width == 128.")
+    combo_diag: dict[str, Any] = {}
+    if allocator_name in {"combo", "combo_two", "quantile_layer"}:
+        expert_scores_by_layer = [channel[int(layer_id)]["expert_structural_scores"] for layer_id in layer_ids]
+        score_tensor = torch.tensor(layer_scores, dtype=torch.float64)
+        if allocator_name == "quantile_layer":
+            logical_widths, combo_diag = allocate_quantile_layer_expert_widths(
+                score_tensor,
+                expert_scores_by_layer,
+                low_width=low_width,
+                high_width=high_width,
+                global_avg_width=float(budget_width),
+                min_fraction=min_fraction,
+            )
+        else:
+            logical_widths, combo_diag = allocate_combo_expert_widths(
+                score_tensor,
+                expert_scores_by_layer,
+                low_width=low_width,
+                mid_width=budget_width,
+                high_width=high_width,
+                global_avg_width=float(budget_width),
+                gamma=gamma,
+                min_fraction=min_fraction,
+                allow_mid=allocator_name == "combo",
+            )
+        if bool(((logical_widths % block) != 0).any()):
+            raise RuntimeError("HARP combo widths must stay multiple of channel alignment.")
+        profile_widths = logical_widths // block
+        expert_widths = logical_widths.tolist()
+        anchor = detect_anchor_layer(score_tensor)
+        if allocator_name == "quantile_layer":
+            allocation_objective = "layer_sp_rank_quantile_then_expert_sp_two_tier"
+            mode = "harp_quantile_layer_expert_channel_sp"
+            declared_widths = [low_width, high_width]
+        elif allocator_name == "combo_two":
+            allocation_objective = "layer_sp_gamma_waterfill_then_two_tier_search"
+            mode = "harp_combo_two_layer_expert_channel_sp"
+            declared_widths = [low_width, high_width]
+        else:
+            allocation_objective = "layer_sp_gamma_waterfill_then_direct_tier_search"
+            mode = "harp_combo_layer_expert_channel_sp"
+            declared_widths = [low_width, budget_width, high_width]
+    else:
+        total_units = layers * experts * (budget_blocks - low_blocks)
+        anchor = detect_anchor_layer(torch.tensor(layer_scores, dtype=torch.float64))
+        layer_units = allocate_layer_upgrade_units(
+            torch.tensor(layer_scores, dtype=torch.float64),
+            total_units=total_units,
+            max_units_per_layer=2 * experts,
+            anchor_layer=anchor,
+            anchor_min_units=experts if anchor is not None else 0,
+        )
+        widths = []
+        expert_widths = []
+        for row, layer_id in enumerate(layer_ids):
+            table = channel[int(layer_id)]
+            expert_scores = table["expert_structural_scores"]
+            units = int(layer_units[row].item())
+            layer_widths = allocate_expert_widths(expert_scores, low_blocks=low_blocks, target_units=units)
+            widths.append(layer_widths)
+            expert_widths.append(layer_widths.tolist())
+        profile_widths = torch.stack(widths)
+        allocation_objective = "layer_sp_budget_then_expert_sp_upgrade_then_channel_sp_prefix"
+        mode = "harp_layer_expert_channel_sp"
+        declared_widths = [low_width, budget_width, high_width]
     target_blocks_by_layer = profile_widths.sum(dim=1).tolist()
+    actual_mean_width = float(profile_widths.float().mean().item() * block)
     profile: dict[str, Any] = {
-        "schema_version": 1, "method": "harp", "mode": "harp_layer_expert_channel_sp",
+        "schema_version": 1, "method": "harp", "mode": mode,
         "created_at": datetime.now(timezone.utc).isoformat(), "model_path": str(model_path), "model_family": adapter.architecture.model_family,
         "profile_construction": "calibration_free", "calibration_split": "not_applicable",
         "calibration_frozen_before_evaluation": True, "test_metrics_used_for_profile": False,
@@ -117,17 +211,30 @@ def build_profile(model_path: Path, output_cache: Path, output_profile: Path, bu
         "num_blocks": adapter.architecture.intermediate_size // block, "channel_block_size": block,
         "intermediate_size": adapter.architecture.intermediate_size,
         "allocation_scope": "per_layer_expert_harp_layer_expert_channel_sp",
-        "allocation_objective": "layer_sp_budget_then_expert_sp_upgrade_then_channel_sp_prefix",
+        "allocation_objective": allocation_objective,
         "target_blocks_by_layer": target_blocks_by_layer, "actual_blocks_by_layer": target_blocks_by_layer,
         "total_blocks": int(profile_widths.sum().item()), "maximum_blocks": layers * experts * (adapter.architecture.intermediate_size // block),
         "target_pruning_ratio": 1.0 - budget_width / adapter.architecture.intermediate_size,
-        "actual_structural_pruning_ratio": 1.0 - budget_width / adapter.architecture.intermediate_size,
+        "actual_structural_pruning_ratio": 1.0 - actual_mean_width / adapter.architecture.intermediate_size,
         "retained_channels": None, "budget_reference_width": budget_width,
-        "width_options": [low_width, budget_width, high_width], "padded_intermediate_size": high_width,
+        "width_options": declared_widths, "padded_intermediate_size": high_width,
         "retained_expert_mask": None, "profile_widths": profile_widths,
         "profile_sha256": hashlib.sha256(profile_widths.numpy().tobytes(order="C")).hexdigest(),
         "csp": {"data_free": True, "weight_only": True, "accumulator_dtype": "float32", "input_scale_mode": "none", "canonicalization": False, "architecture": adapter.metadata(),
-                "harp": {"layer_scores": layer_scores, "layer_order_descending": sorted(layer_ids, key=lambda i: (-layer_scores[i], i)), "anchor_layer": anchor, "low_width": low_width, "budget_width": budget_width, "high_width": high_width, "expert_widths_by_layer": expert_widths}},
+                "harp": {
+                    "allocator": allocator_name,
+                    "layer_scores": layer_scores,
+                    "layer_order_descending": [
+                        int(layer_ids[row])
+                        for row in sorted(range(layers), key=lambda idx: (-layer_scores[idx], int(layer_ids[idx])))
+                    ],
+                    "anchor_layer": anchor,
+                    "low_width": low_width,
+                    "budget_width": budget_width,
+                    "high_width": high_width,
+                    "expert_widths_by_layer": expert_widths,
+                    **combo_diag,
+                }},
         "cache_provenance": {"channel": {"path": str(channel_path), "sha256": file_sha256(channel_path), "role": "harp_ranking"}},
     }
     validate_static_profile_payload(profile)
@@ -145,8 +252,25 @@ def main() -> int:
     parser.add_argument("--budget-width", type=int, required=True)
     parser.add_argument("--low-width", type=int, required=True)
     parser.add_argument("--high-width", type=int, required=True)
+    parser.add_argument(
+        "--allocator",
+        choices=("legacy", "combo", "combo_two", "quantile_layer"),
+        default="legacy",
+    )
+    parser.add_argument("--gamma", type=float, default=2.0)
+    parser.add_argument("--min-fraction", type=float, default=0.15)
     args = parser.parse_args()
-    build_profile(args.model_path.expanduser().resolve(), args.output_channel_cache, args.output_profile, args.budget_width, args.low_width, args.high_width)
+    build_profile(
+        args.model_path.expanduser().resolve(),
+        args.output_channel_cache,
+        args.output_profile,
+        args.budget_width,
+        args.low_width,
+        args.high_width,
+        allocator=args.allocator,
+        gamma=args.gamma,
+        min_fraction=args.min_fraction,
+    )
     return 0
 
 
