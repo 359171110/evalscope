@@ -107,10 +107,12 @@ the exact bounded budget:
 K_{low}\leq K_l^{target}\leq K_{high}.
 \]
 
-The residual is distributed uniformly over layers that have not reached the
-relevant bound. This preserves the score-induced ordering while preventing an
-outlier such as Qwen3.6 Layer 0 from discarding global capacity after it
-saturates at `K_high`.
+The residual is assigned by Layer-SP priority (the rank-priority closure):
+positive residual budget is filled into the highest-ranked unsaturated layers
+first; negative residual is removed from the lowest-ranked layers first. This
+preserves the score-induced ordering while preventing an outlier such as
+Qwen3.6 Layer 0 from discarding global capacity after it saturates at
+`K_high`. We do not uniformly spread the residual over all unsaturated layers.
 
 The default is:
 
@@ -378,17 +380,17 @@ Downstream accuracy and runtime comparisons are separate experiments. This docum
 
 ## 14. Qwen profile-only observations
 
-The implemented method was run on the existing Qwen3 and Qwen3.6 HARP ranking
-caches at 50% and 25% pruning targets. No checkpoint was exported and no
-downstream evaluation was run.
+The implemented rank-priority closure was run on the existing Qwen3 and
+Qwen3.6 HARP ranking caches at 50% and 25% pruning targets. No checkpoint was
+exported and no downstream evaluation was run.
 
 Artifacts:
 
 ```text
-HARP/experiments/v2_rank_adaptive_20260908/qwen3/v2_rank_adaptive_50.pt
-HARP/experiments/v2_rank_adaptive_20260908/qwen3/v2_rank_adaptive_25.pt
-HARP/experiments/v2_rank_adaptive_20260908/qwen36/v2_rank_adaptive_50.pt
-HARP/experiments/v2_rank_adaptive_20260908/qwen36/v2_rank_adaptive_25.pt
+HARP/experiments/v2_rank_priority_20260908/qwen3/rank_priority_50.pt
+HARP/experiments/v2_rank_priority_20260908/qwen3/rank_priority_25.pt
+HARP/experiments/v2_rank_priority_20260908/qwen36/rank_priority_50.pt
+HARP/experiments/v2_rank_priority_20260908/qwen36/rank_priority_25.pt
 ```
 
 ### 14.1 Qwen3
@@ -401,7 +403,8 @@ For both pruning targets:
 - 27/48 layers have a stable Expert-SP head, recorded only as diagnostics;
 - no head rank is used as a high-expert count;
 - tier counts are 2054 high / 2036 mid / 2054 low;
-- the exact closure requires one one-tier upgrade beyond the base combo result.
+- the rank-priority target projection preserves the high-ranked layer budget;
+- no uniform all-layer residual allocation is used.
 
 The projected layer target range is:
 
@@ -424,7 +427,8 @@ For both pruning targets:
 - 15/40 layers have a stable Expert-SP head, recorded only as diagnostics;
 - no head rank is used as a high-expert count;
 - tier counts are 3449 high / 3342 mid / 3449 low;
-- no post-search tier upgrade is needed after exact target projection.
+- no post-search tier upgrade is needed after rank-priority target projection;
+- the residual budget is not spread across all 39 non-maximum layers.
 
 The projected layer target range is:
 
@@ -434,9 +438,11 @@ The projected layer target range is:
 ```
 
 Layer 0 reaches `K_high`, as expected from its extreme Layer-SP. Its clipped
-overflow is redistributed over the unsaturated layers instead of being lost.
-This corrects the base combo behavior, whose actual average was approximately
-3.5 channels below the requested Qwen3.6 target.
+overflow is assigned by Layer-SP rank to the highest-priority unsaturated
+layers instead of being spread uniformly across weak layers. This corrects the
+base combo behavior, whose actual average was approximately 3.5 channels below
+the requested Qwen3.6 target, without introducing the previous 559-expert
+uniform upgrade pattern.
 
 ### 14.3 Structural conclusion
 
@@ -445,9 +451,11 @@ The two-model run confirms the intended algorithm behavior:
 1. HARP-v2 water-fill and direct tier search remain the allocation backbone.
 2. Expert head ranks are never converted into tier counts.
 3. Rank diagnostics are available without changing the combo objective.
-4. Bounded target projection handles extreme Layer-SP clipping.
+4. Bounded rank-priority target projection handles extreme Layer-SP clipping.
 5. Aligned discrete closure makes the global average width exact.
-6. All expert widths remain in the configured low/mid/high set.
+6. The residual is directed to high Layer-SP ranks rather than uniformly to all
+  unsaturated layers.
+7. All expert widths remain in the configured low/mid/high set.
 
 These checks establish that the method construction works as specified. They do
 not establish an accuracy improvement because no model evaluation was performed.

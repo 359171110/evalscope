@@ -288,14 +288,15 @@ def allocate_v2_rank_adaptive_widths(
         high_width=int(high_width),
         gamma=float(gamma),
     )
+    order = torch.argsort(layer_scores, descending=True, stable=True)
     targets = _project_bounded_targets(
         initial_targets,
         target_sum=float(layers * int(mid_width)),
         lower=float(low_width),
         upper=float(high_width),
+        priority=order,
     )
     budgets = (targets * experts).tolist()
-    order = torch.argsort(layer_scores, descending=True, stable=True)
     ranks = torch.empty_like(order)
     ranks.scatter_(0, order, torch.arange(1, layers + 1, dtype=torch.long))
     widths = torch.zeros((layers, experts), dtype=torch.long)
@@ -390,21 +391,37 @@ def _project_bounded_targets(
     target_sum: float,
     lower: float,
     upper: float,
+    priority: torch.Tensor,
 ) -> torch.Tensor:
-    """Shift clipped layer targets to an exact bounded global sum."""
+    """Project clipped targets with residual budget assigned by Layer-SP rank."""
 
     projected = targets.to(dtype=torch.float64).clamp(min=lower, max=upper).clone()
-    for _ in range(int(projected.numel()) + 1):
-        residual = float(target_sum - projected.sum().item())
-        if abs(residual) <= 1.0e-9:
-            return projected
-        movable = projected < upper - 1.0e-12 if residual > 0.0 else projected > lower + 1.0e-12
-        count = int(movable.sum().item())
-        if count == 0:
-            break
-        projected[movable] += residual / count
-        projected.clamp_(min=lower, max=upper)
-    if abs(float(projected.sum().item()) - target_sum) > 1.0e-6:
+    if priority.ndim != 1 or priority.numel() != projected.numel():
+        raise ValueError("priority must be a permutation matching targets.")
+    if sorted(priority.tolist()) != list(range(int(projected.numel()))):
+        raise ValueError("priority must be a permutation of target indices.")
+    residual = float(target_sum - projected.sum().item())
+    if residual > 0.0:
+        for row in priority.tolist():
+            room = float(upper - projected[row])
+            if room <= 1.0e-12:
+                continue
+            amount = min(residual, room)
+            projected[row] += amount
+            residual -= amount
+            if residual <= 1.0e-9:
+                break
+    elif residual < 0.0:
+        for row in reversed(priority.tolist()):
+            room = float(projected[row] - lower)
+            if room <= 1.0e-12:
+                continue
+            amount = min(-residual, room)
+            projected[row] -= amount
+            residual += amount
+            if residual >= -1.0e-9:
+                break
+    if abs(residual) > 1.0e-6 or abs(float(projected.sum().item()) - target_sum) > 1.0e-6:
         raise RuntimeError("Unable to project Layer-SP targets onto the exact bounded budget.")
     return projected
 
