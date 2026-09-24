@@ -1,393 +1,140 @@
-<p align="center">
-    <br>
-    <img src="docs/en/_static/images/evalscope_logo.png"/>
-    <br>
-<p>
+# EvalScope · 静态 / 结构化 MoE 剪枝研究分叉
 
-<p align="center">
-  <a href="README_zh.md">中文</a> &nbsp ｜ &nbsp English &nbsp
-</p>
+**Private research fork** — static / structured Mixture-of-Experts pruning, with EvalScope as the unified capability-eval layer.
 
-<p align="center">
-<img src="https://img.shields.io/badge/python-%E2%89%A53.10-5be.svg">
-<a href="https://badge.fury.io/py/evalscope"><img src="https://badge.fury.io/py/evalscope.svg" alt="PyPI version" height="18"></a>
-<a href="https://pypi.org/project/evalscope"><img alt="PyPI - Downloads" src="https://static.pepy.tech/badge/evalscope"></a>
-<a href="https://github.com/modelscope/evalscope/pulls"><img src="https://img.shields.io/badge/PR-welcome-55EB99.svg"></a>
-<a href='https://evalscope.readthedocs.io/en/latest/?badge=latest'><img src='https://readthedocs.org/projects/evalscope/badge/?version=latest' alt='Documentation Status' /></a>
-<p>
+本仓库面向 **静态 / 结构化 MoE 剪枝** 实验：在 routed expert 内部做等宽或分层 channel 剪枝（或对照 whole-expert 删除），用冻结的 EvalScope 协议做下游能力比较。EvalScope 本体仍在 `evalscope/`；剪枝方法、协议 overlay 和结果说明在仓库根目录。
 
-<p align="center">
-<a href="https://evalscope.readthedocs.io/zh-cn/latest/"> 📖  中文文档</a> &nbsp ｜ &nbsp <a href="https://evalscope.readthedocs.io/en/latest/"> 📖  English Documentation</a>
-<p>
+## 上游与许可证
 
+- 分叉自 [`modelscope/evalscope`](https://github.com/modelscope/evalscope)，许可证 **Apache-2.0**。
+- 本仓库按设计应为 **私有**，已相对上游分叉演进（方法目录、协议与手册远超社区 EvalScope）。**不要当成 drop-in community fork。**
+- 不定期回并上游产品功能。上游文档站点描述的是通用评测框架，不是本分叉的 MoE 实验协议。
 
-> ⭐ If you like this project, please click the "Star" button in the upper right corner to support us. Your support is our motivation to move forward!
+## 本分叉增加了什么
 
-## 📝 Introduction
+相对上游 EvalScope，这里主要多了四类内容。
 
-EvalScope is a one-stop LLM evaluation framework built by the [ModelScope Community](https://modelscope.cn/). Just one command to start — it supports model capability evaluation, inference performance stress testing, and result visualization.
+### 1. 评测协议 overlay
 
-```bash
-pip install evalscope
-evalscope eval --model your-model-name --api-url $OPENAI_API_BASE_URL --api-key $OPENAI_API_KEY --eval-type openai_api --datasets gsm8k --limit 5
-```
+可移植的 Quick9 / full6 / full8 协议，正式路径是 `checkpoint → vLLM → EvalScope openai_api`：
 
-## ✨ Key Features
+| 路径 | 作用 |
+| --- | --- |
+| [`eval_protocol/`](eval_protocol/README.md) | 冻结 JSON：`quick9.json`、`full6_v1.json`、`full8_v1.json`；`run_vllm_protocol.sh` |
+| [`测评协议.md`](测评协议.md) | MoE 公平预算、harness 分层、校准与 SHA256 审计 |
+| [`STATIC_MOE_PRUNING_FRAMEWORK_MANUAL.md`](STATIC_MOE_PRUNING_FRAMEWORK_MANUAL.md) | 校准、导出、实验目录命名、结果落盘规范 |
+| [`scripts/watch_eval_reports.sh`](scripts/watch_eval_reports.sh) | 协议校验后的报告汇总（不要绕过它手拼分数） |
 
-- **📚 Comprehensive Evaluation Benchmarks**: Built-in multiple industry-recognized evaluation benchmarks including MMLU, C-Eval, GSM8K, and more.
-- **🧩 Multi-modal and Multi-domain Support**: Supports evaluation of various model types including Large Language Models (LLM), Vision Language Models (VLM), Embedding, Reranker, AIGC, and more.
-- **🚀 Multi-backend Integration**: Seamlessly integrates multiple evaluation backends including OpenCompass, VLMEvalKit, RAGEval to meet different evaluation needs.
-- **🤖 Agent Evaluation Mode**: Drives benchmarks (e.g. GSM8K, AIME, SWE-bench Agentic) inside a controlled multi-turn AgentLoop with pluggable strategies, tools and Docker sandbox; full per-sample Agent Trace is recorded and visualizable.
-- **⚡ Inference Performance Testing**: Provides powerful model service stress testing tools, supporting multiple performance metrics such as TTFT, TPOT.
-- **📊 Interactive Reports**: Provides WebUI visualization interface, supporting multi-dimensional model comparison, report overview and detailed inspection.
-- **⚔️ Arena Mode**: Supports multi-model battles (Pairwise Battle), intuitively ranking and evaluating models.
-- **🔧 Highly Extensible**: Developers can easily add custom datasets, models and evaluation metrics.
+本地加载补丁仍在 EvalScope adapter 内：MMLU 可读本地 CSV 目录，WinoGrande 可读 `winogrande_1.1.zip`。
 
-## 📊 Visualization Preview
+### 2. 根目录剪枝方法
 
-EvalScope provides an interactive Web Dashboard for multi-dimensional model comparison and in-depth analysis.
+根目录每个文件夹是一套独立方法或对照实现。**没有名为 `HSP/` 的顶层目录**；HSP-Hetero / AHSP 在 `CSP/` 内。另有 `RAMP/`（可重构性感知剪枝），不在早期清单里，但树中存在。
 
-<table>
-  <tr>
-    <td style="text-align: center;">
-      <img src="https://sail-moe.oss-cn-hangzhou.aliyuncs.com/yunlin/images/evalscope/dashboard/dashboard_overview.png" alt="Dashboard" style="width: 100%;" />
-      <p>Dashboard Overview</p>
-    </td>
-    <td style="text-align: center;">
-      <img src="https://sail-moe.oss-cn-hangzhou.aliyuncs.com/yunlin/images/evalscope/dashboard/compare_score_tab.png" alt="Model Compare" style="width: 100%;" />
-      <p>Model Comparison</p>
-    </td>
-  </tr>
-  <tr>
-    <td style="text-align: center;">
-      <img src="https://sail-moe.oss-cn-hangzhou.aliyuncs.com/yunlin/images/evalscope/dashboard/report_overview_tab.png" alt="Report Overview" style="width: 100%;" />
-      <p>Report Overview</p>
-    </td>
-    <td style="text-align: center;">
-      <img src="https://sail-moe.oss-cn-hangzhou.aliyuncs.com/yunlin/images/evalscope/dashboard/report_predictions_tab.png" alt="Report Predictions" style="width: 90%;" />
-      <p>Prediction Details</p>
-    </td>
-  </tr>
-</table>
+详见下一节导航表。
 
-For details, please refer to [📖 Visualizing Evaluation Results](https://evalscope.readthedocs.io/en/latest/get_started/visualization.html).
+### 3. Serving 环境与启动器
 
-## 🎉 What's New
+[`eval_protocol/envs/gemma4-vllm-cu128/`](eval_protocol/envs/gemma4-vllm-cu128/README.md) 冻结统一 serving 环境（Python 3.10、torch `2.11.0+cu128`、vLLM `0.23.1.dev0` + CUDA 12.8 补丁）。覆盖：
 
-- 🔥 **[2026.07.21]** Added **Claw-Eval**, **ResearchRubrics**, **Toolathlon** (agent), **TVBench** (video), **WideSearch**, and **PerspectiveGap** benchmarks.
-- 🔥 **[2026.07.03]** Added **CharXiv** & **BabyVision** (chart understanding, visual cognition) and **ERQA** & **WorldVQA** (entity-recognition QA with LLM-judge + CoT) multimodal benchmarks.
-- 🔥 **[2026.06.23]** Major agent & code evaluation expansion: added **BigCodeBench**, **SWE-bench Multilingual**, **BrowseComp**, **MCP-Atlas**, **GDPval** benchmarks; added **OpenCode** / **OpenHands** runners; refactored adapter architecture with `AudioLanguageAdapter`, unified `FunctionCallAdapter`, and public `run_agent_loop` API.
-- 🔥 **[2026.06.16]** Added full-reference **image quality metrics** (SSIM, PSNR, etc.), long-context benchmarks (**LoCoMo QA**, **LongMemEval**), **Caption** & **Maritime-OCR-Bench** benchmarks; perf module now supports unified `--data-source` and parallelized request generation.
-- 🔥 **[2026.06.02]** Refactored **RAG evaluation** module: upgraded to MTEB 2.x and RAGAS 0.4.x, with unified Pydantic-based configs. See the [RAGEval guide](https://evalscope.readthedocs.io/en/latest/user_guides/backend/rageval_backend/index.html).
-- 🔥 **[2026.05.27]** Added **Trie agentic trace replay** for perf benchmarking: three new dataset plugins (`trie_agentic_coding` / `trie_code_qa` / `trie_office_work`) replay real multi-turn agent traces with per-turn token caps and tool-call latency simulation. Also introduced a `--duration` wall-clock budget for all benchmark modes and a `Turn` dataclass for per-turn overrides.
-- 🔥 **[2026.05.27]** Added **Vendor Verifier benchmarks** (`k2_verifier`, `kimi_verifier`, `minimax_verifier`) for validating whether third-party API deployments faithfully reproduce official model behavior, with a shared `FunctionCallAdapter` base class.
-- 🔥 **[2026.05.26]** Added the [GAIA](https://evalscope.readthedocs.io/en/latest/third_party/gaia.html) agent benchmark (multi-turn ReAct + `bash` in a Docker sandbox, official rule-based scorer) and generic [MCP server](https://evalscope.readthedocs.io/en/latest/user_guides/agent/native.html#mcp-server-tools) support — any `NativeAgentConfig`-driven benchmark can now plug in stdio / HTTP / SSE MCP servers (`fetch`, web search, GitHub, ...) without per-benchmark wiring.
-- 🔥 **[2026.05.22]** Introduced the **External Agent Bridge** mode: evaluate off-the-shelf agent CLIs such as Anthropic's [Claude Code](https://github.com/anthropics/claude-code) and OpenAI's [Codex](https://github.com/openai/codex) directly through EvalScope. The bridge transparently forwards each CLI's LLM traffic (Anthropic Messages / OpenAI Chat / OpenAI Responses, including SSE streaming) to your evaluation model, while recording the full trajectory as an `agent_trace`. Bring-your-own-runner via `@register_runner`. See the [External Agent Bridge guide](https://evalscope.readthedocs.io/en/latest/user_guides/agent/bridge.html).
-- 🔥 **[2026.05.19]** Added support for [SWE-bench_Pro](https://evalscope.readthedocs.io/en/latest/third_party/swe_bench_pro.html) and [τ³-bench](https://evalscope.readthedocs.io/en/latest/third_party/tau3_bench.html): SWE-bench_Pro is a more challenging multilingual long-horizon software-engineering benchmark from Scale AI (recommended over the original SWE-bench for less data contamination and broader language coverage; per-instance Docker images are pulled directly from DockerHub, no local image build required); τ³-bench is the v1.0.0 release of the tau-bench family, extending τ²-bench with a new `banking_knowledge` retrieval domain (RAG), 75+ task fixes across existing domains, and pluggable retrieval pipelines (BM25 / embeddings / rerankers / sandbox shell).
-- 🔥 **[2026.05.15]** Introduced **Agent Evaluation Mode**: any benchmark based on `DefaultDataAdapter` (GSM8K, AIME, IFEval, etc.) can now be driven through a multi-turn AgentLoop with pluggable strategies (`function_calling` / `react` / `swe_bench_*`), tools (`bash` / `python_exec` / `submit`) and `local` / `docker` environments. Per-sample `agent_trace` is recorded and rendered step-by-step in the dashboard's Predictions tab. See the [Agent Evaluation guide](https://evalscope.readthedocs.io/en/latest/user_guides/agent/native.html) for details.
-- 🔥 **[2026.05.08]** Partnered with [LightSeek](https://lightseek.org/) to launch [TokenSpeed](https://lightseek.org/blog/lightseek-tokenspeed.html), a speed-of-light LLM inference engine for agentic workloads. EvalScope provides the SWE-smith benchmarking pipeline — using real coding-agent traces to measure per-GPU throughput (TPM) and per-user latency (TPS) — serving as the official benchmark tool for TokenSpeed performance evaluation. Refer to the [SWE-smith usage guide](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/multi_turn.html#swe-smith) to get started.
+- Qwen3-30B-A3B-Instruct-2507
+- Qwen3.6-35B-A3B
+- Gemma4-26B-A4B-it
+- DeepSeek-V2-Lite-Chat
 
-<details><summary>More historical updates</summary>
+用 `setup_gemma4_vllm_cu128.sh` 在新机器重建；**不要**把 conda env 或 vLLM 源码树提交进 git。
 
-- 🔥 **[2026.05.07]** Replaced the Gradio-based WebUI with a new React + Vite web interface for better performance and user experience.
-- 🔥 **[2026.04.23]** Added support for recording performance (perf) metrics during evaluation tasks, enabling simultaneous tracking of model accuracy and inference efficiency metrics such as TTFT, TPOT, and throughput in a single evaluation run.
-- 🔥 **[2026.04.17]** Added support for multi-turn conversation performance stress testing, enabling load testing of dialogue-based model services with multi-turn context. Refer to the [usage documentation](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/examples.html).
-- 🔥 **[2026.04.10]** Added support for [TIR-Bench](https://arxiv.org/abs/2511.01833) (Thinking-with-Images Reasoning Benchmark), a multimodal benchmark evaluating agentic visual reasoning capabilities of vision-language models.
-- 🔥 **[2026.03.24]** Added support for Agent Skill. Any agent model that supports Skill/Tool calling can use natural language to drive EvalScope for model evaluation, performance benchmarking, and result visualization.
-- 🔥 **[2026.03.09]** Added support for evaluation progress tracking and HTML format visualization report generation.
-- 🔥 **[2026.03.02]** Added support for Anthropic Claude API evaluation. Use `--eval-type anthropic_api` to evaluate models via Anthropic API service.
-- 🔥 **[2026.02.03]** Comprehensive update to dataset documentation, adding data statistics, data samples, usage instructions and more.
-- 🔥 **[2026.01.13]** Added support for Embedding and Rerank model service stress testing.
-- 🔥 **[2025.12.26]** Added support for Terminal-Bench-2.0, which evaluates AI Agent performance on 89 real-world multi-step terminal tasks.
-- 🔥 **[2025.12.18]** Added support for SLA auto-tuning model API services.
-- 🔥 **[2025.12.16]** Added support for audio evaluation benchmarks such as Fleurs, LibriSpeech; added support for multilingual code evaluation benchmarks such as MultiplE, MBPP.
-- 🔥 **[2025.12.02]** Added support for custom multimodal VQA evaluation; added support for visualizing model service stress testing in ClearML.
-- 🔥 **[2025.11.26]** Added support for OpenAI-MRCR, GSM8K-V, MGSM, MicroVQA, IFBench, SciCode benchmarks.
-- 🔥 **[2025.11.18]** Added support for custom Function-Call (tool invocation) datasets to test whether models can timely and correctly call tools.
-- 🔥 **[2025.11.14]** Added support for SWE-bench_Verified, SWE-bench_Lite, SWE-bench_Verified_mini code evaluation benchmarks.
-- 🔥 **[2025.11.12]** Added `pass@k`, `vote@k`, `pass^k` and other metric aggregation methods; added support for multimodal evaluation benchmarks such as A_OKVQA, CMMU, ScienceQA, V*Bench.
-- 🔥 **[2025.11.07]** Added support for τ²-bench, an extended and enhanced version of τ-bench that includes a series of code fixes and adds telecom domain troubleshooting scenarios.
-- 🔥 **[2025.10.30]** Added support for BFCL-v4, enabling evaluation of agent capabilities including web search and long-term memory.
-- 🔥 **[2025.10.27]** Added support for LogiQA, HaluEval, MathQA, MRI-QA, PIQA, QASC, CommonsenseQA and other evaluation benchmarks. Thanks to @[penguinwang96825](https://github.com/penguinwang96825) for the code implementation.
-- 🔥 **[2025.10.26]** Added support for Conll-2003, CrossNER, Copious, GeniaNER, HarveyNER, MIT-Movie-Trivia, MIT-Restaurant, OntoNotes5, WNUT2017 and other Named Entity Recognition evaluation benchmarks. Thanks to @[penguinwang96825](https://github.com/penguinwang96825) for the code implementation.
-- 🔥 **[2025.10.21]** Optimized sandbox environment usage in code evaluation, supporting both local and remote operation modes.
-- 🔥 **[2025.10.20]** Added support for evaluation benchmarks including PolyMath, SimpleVQA, MathVerse, MathVision, AA-LCR; optimized evalscope perf performance to align with vLLM Bench.
-- 🔥 **[2025.10.14]** Added support for OCRBench, OCRBench-v2, DocVQA, InfoVQA, ChartQA, and BLINK multimodal image-text evaluation benchmarks.
-- 🔥 **[2025.09.22]** Code evaluation benchmarks (HumanEval, LiveCodeBench) now support running in a sandbox environment.
-- 🔥 **[2025.09.19]** Added support for multimodal image-text evaluation benchmarks including RealWorldQA, AI2D, MMStar, MMBench, and OmniBench, as well as pure text evaluation benchmarks such as Multi-IF, HealthBench, and AMC.
-- 🔥 **[2025.09.05]** Added support for vision-language multimodal model evaluation tasks, such as MathVista and MMMU.
-- 🔥 **[2025.09.04]** Added support for image editing task evaluation, including the [GEdit-Bench](https://modelscope.cn/datasets/stepfun-ai/GEdit-Bench) benchmark.
-- 🔥 **[2025.08.22]** Version 1.0 Refactoring. Break changes, please [refer to](https://evalscope.readthedocs.io/en/latest/get_started/basic_usage.html#switching-to-version-v1-0).
-- 🔥 **[2025.07.18]** The model stress testing now supports randomly generating image-text data for multimodal model evaluation.
-- 🔥 **[2025.07.16]** Support for [τ-bench](https://github.com/sierra-research/tau-bench) has been added.
-- 🔥 **[2025.07.14]** Support for "Humanity's Last Exam" ([Humanity's-Last-Exam](https://modelscope.cn/datasets/cais/hle)).
-- 🔥 **[2025.07.03]** Refactored Arena Mode.
-- 🔥 **[2025.06.28]** Optimized custom dataset evaluation; enhanced LLM judge usage.
-- 🔥 **[2025.06.19]** Added support for the [BFCL-v3](https://modelscope.cn/datasets/AI-ModelScope/bfcl_v3) benchmark.
-- 🔥 **[2025.06.02]** Added support for the Needle-in-a-Haystack test.
-- 🔥 **[2025.05.29]** Added support for two long document evaluation benchmarks: DocMath and FRAMES.
-- 🔥 **[2025.05.16]** Model service performance stress testing now supports setting various levels of concurrency.
-- 🔥 **[2025.05.13]** Added support for the ToolBench-Static dataset, DROP and Winogrande benchmarks.
-- 🔥 **[2025.04.29]** Added Qwen3 Evaluation Best Practices.
-- 🔥 **[2025.04.27]** Support for text-to-image evaluation.
-- 🔥 **[2025.04.10]** Model service stress testing tool now supports the `/v1/completions` endpoint.
-- 🔥 **[2025.04.08]** Support for evaluating embedding model services compatible with the OpenAI API has been added.
-- 🔥 **[2025.03.27]** Added support for AlpacaEval and ArenaHard evaluation benchmarks.
-- 🔥 **[2025.03.20]** The model inference service stress testing now supports generating prompts of specified length using random values.
-- 🔥 **[2025.03.13]** Added support for the LiveCodeBench code evaluation benchmark.
-- 🔥 **[2025.03.11]** Added support for the SimpleQA and Chinese SimpleQA evaluation benchmarks.
-- 🔥 **[2025.03.07]** Added support for the QwQ-32B model evaluation.
-- 🔥 **[2025.03.04]** Added support for the SuperGPQA dataset.
-- 🔥 **[2025.03.03]** Added support for evaluating the IQ and EQ of models.
-- 🔥 **[2025.02.27]** Added support for evaluating the reasoning efficiency of models.
-- 🔥 **[2025.02.25]** Added support for MuSR and ProcessBench benchmarks.
-- 🔥 **[2025.02.18]** Supports the AIME25 dataset.
-- 🔥 **[2025.02.13]** Added support for evaluating DeepSeek distilled models.
-- 🔥 **[2025.01.20]** Support for visualizing evaluation results.
-- 🔥 **[2025.01.07]** Native backend: Support for model API evaluation.
-- 🔥🔥 **[2024.12.31]** Support for adding benchmark evaluations.
-- 🔥 **[2024.12.13]** Model evaluation optimization.
-- 🔥 **[2024.11.26]** The model inference service performance evaluator has been completely refactored.
-- 🔥 **[2024.10.31]** The best practice for evaluating Multimodal-RAG has been updated.
-- 🔥 **[2024.10.23]** Supports multimodal RAG evaluation.
-- 🔥 **[2024.10.8]** Support for RAG evaluation.
-- 🔥 **[2024.09.18]** Documentation added blog module.
-- 🔥 **[2024.09.12]** Support for LongWriter evaluation.
-- 🔥 **[2024.08.30]** Support for custom dataset evaluations.
-- 🔥 **[2024.08.20]** Updated the official documentation.
-- 🔥 **[2024.08.09]** Simplified the installation process.
-- 🔥 **[2024.07.31]** Important change: The package name `llmuses` has been changed to `evalscope`.
-- 🔥 **[2024.07.26]** Support for **VLMEvalKit** as a third-party evaluation framework.
-- 🔥 **[2024.06.29]** Support for **OpenCompass** as a third-party evaluation framework.
-- 🔥 **[2024.06.13]** EvalScope integrates with SWIFT; Integrated the Agent evaluation dataset ToolBench.
+### 4. 结果文档与自定义评测
 
-</details>
+- [`Results.md`](Results.md) / [`Results_analysis.md`](Results_analysis.md)：下游表与诊断笔记。由 `scripts/compile_results_md.py` 生成；不要把大表贴进本 README。
+- [`custom_eval/`](custom_eval/)：额外文本 / 多模态自定义评测样例。
 
-## 🚀 Quick Start
+## 评测立场
 
-### Installation
+来自 `测评协议.md` 与 `eval_protocol/README.md` 的硬约束：
 
-```shell
-pip install evalscope
-```
+1. **主能力表只用固定 EvalScope。** 同一横向比较锁定 commit、TaskConfig、prompt、few-shot、decoding、answer extraction。当前冻结生成约束：`seed=42`、`shuffle=false`、`temperature=0`、`do_sample=false`、`enable_thinking=false`。
+2. **MoE 公平性审计单独做。** matched routed-expert FFN 预算、shared expert 隔离（不剪、不计 routed budget）、64-channel block / width、profile 与 checkpoint SHA256。这些字段不是能力分数，不要塞进主表同一列。
+3. **不要混 harness。** OpenCompass、`lm-evaluation-harness`、LightEval 若跑了，只能作为论文协议复核的次列，不得与 EvalScope 主表混算。
+4. **能导出标准 HF checkpoint 的方法，正式评测必须走 vLLM。** `static_expert_profile` 只用于标准 vLLM 表达不了的异构结构、单测和小规模一致性检查。
+5. **校准只用 train split。** profile 必须在看 validation / test 指标前冻结。
 
-> For detailed installation instructions (source install, extra dependencies, etc.), please refer to the [📖 Installation Guide](https://evalscope.readthedocs.io/en/latest/get_started/installation.html).
+| 协议 | 用途 | 规模 |
+| --- | --- | ---: |
+| `quick9` | 冻结的快速横向比较 | 6 数据集子集，共 2798 条 |
+| `full6_v1` | 正式全量确认 | 同上 6 个全 split，共 30718 条 |
+| `full8_v1` | 全量 + 代码 | full6 + HumanEval 164 + MBPP 500 |
 
-### Method 1. Evaluate an Online Model API (Recommended for beginners, no GPU required)
+数据集顺序固定：ARC → HellaSwag → WinoGrande → GSM8K → MATH-500 → MMLU（full8 再加 HumanEval / MBPP）。**不要把 Quick9 分数和 full6/full8 并排当成同一协议。** 报告六（或八）数据集分数与宏平均，不用样本数加权冒充总分。
 
-Supports any OpenAI API-compatible model service. Just set `$OPENAI_API_BASE_URL` and `$OPENAI_API_KEY` and you are ready to go:
+## 方法导航
+
+从文件夹 README / DESIGN 进入，不要从根 README 猜超参。
+
+| 目录 | 是什么 | 从哪里开始 |
+| --- | --- | --- |
+| [`AIMER/`](AIMER/src/calib_free_prune.py) | 原版 calibration-free AIMER（whole-expert 风格，复用 REAP 脚手架） | `AIMER/scripts/command_calibfree.sh`、`AIMER/src/calib_free_prune.py` |
+| [`AIMER_Channel/`](AIMER_Channel/readme.md) | data-free 等宽 channel：concat gate/up/down 的 inverse-AIMER | `AIMER_Channel/readme.md` |
+| [`AIMER_Mix/`](AIMER_Mix/readme.md) | AIMER × 几何能量的 rank 混合；CalibrationFree | `AIMER_Mix/readme.md`、`run_calibration_free_full8.sh` |
+| [`AIMER_MIX_PLUS/`](AIMER_MIX_PLUS/readme.md) | Mix 骨干 + PP / PRP / LayerProp 伪源救援 | `AIMER_MIX_PLUS/readme.md` |
+| [`AIMER_UNIFY/`](AIMER_UNIFY/readme.md) | 同一套 Mix / LayerProp / PRP 融合，不按模型名分支 | `AIMER_UNIFY/readme.md` |
+| [`CSP/`](CSP/readme.md) | Canonical Structural Participation；**HSP-Hetero** 与 **AHSP** 也在此目录 | `CSP/readme.md`；HSP：`run_one_model_hsp_full8.sh` |
+| [`HARP/`](HARP/readme.md) | 分层结构剪枝（Layer-SP → Expert-SP → Channel-SP）；含 RankAdaptive | `HARP/readme.md`、[`HARP_RankAdaptive.md`](HARP/HARP_RankAdaptive.md) |
+| [`Wanda/`](Wanda/readme.md) | WikiText128×2048 校准的 structured Wanda | `Wanda/readme.md`、`run_wikitext128x2048_full8.sh` |
+| [`Magnitude/`](Magnitude/readme.md) | data-free 联合 L2 magnitude 基线 | `Magnitude/readme.md` |
+| [`Random/`](Random/readme.md) | 每 expert 随机 channel 排列基线 | `Random/readme.md` |
+| [`Product/`](Product/readme.md) | gate×up L2 乘积基线（down 不进 ranking） | `Product/readme.md` |
+| [`Geom/`](Geom/readme.md) | 三投影 L2 几何均值基线 | `Geom/readme.md` |
+| [`TENP/`](TENP/readme.md) | **uniform-width ENP-COS**（不是完整 TENP 论文流程） | `TENP/readme.md`、`run_wikitext128x2048_full8.sh` |
+| [`WICK/`](WICK/README.md) | data-free：几何均值 rank + router 伪探针保护 | `WICK/README.md` |
+| [`PP/`](PP/README.md) | Pure-Pseudo：只用 router 伪探针分数，无 weight-only 保护 | `PP/README.md` |
+| [`ROUTER_LAYERPROP/`](ROUTER_LAYERPROP/README.md) | data-free、router-conditioned LayerProp 与伪 token 传播 | `ROUTER_LAYERPROP/README.md` |
+| [`ROUTING_AWARE_HETEROGENEOUS/`](ROUTING_AWARE_HETEROGENEOUS/README.md) | 自校准、routing-aware 异构宽度计划 | `ROUTING_AWARE_HETEROGENEOUS/README.md` |
+| [`NAPS/`](NAPS/NAPS_DESIGN.md) | Native-Route AIMER Protection and Selection | `NAPS/NAPS_DESIGN.md`、`run_experiment.sh` |
+| [`NAPS_v2/`](NAPS_v2/NAPS_v2_DESIGN.md) | NAPS-v2：选择与输出补偿分离 | `NAPS_v2/NAPS_v2_DESIGN.md`、`run_experiment.sh` |
+| [`RAMP/`](RAMP/ramp_design.md) | Reconstructability-Aware 异构 channel 剪枝 | `RAMP/ramp_design.md` |
+| [`static_moe_prunning/`](static_moe_prunning/README.md) | V4 静态专家剪枝（prefix block、Route×Tail / Tail-Risk 等） | `static_moe_prunning/README.md` |
+| [`reap/`](reap/README.md) | 第三方 **REAP** 官方实现，作 whole-expert 对照 | `reap/README.md`；公平比较约束见 `测评协议.md` |
+| [`calibration_method/`](calibration_method/self%20moe%20calibration/readme.md) | Checkpoint-Native MoE Self-Calibration（模型自生成校准 token） | `calibration_method/self moe calibration/readme.md` |
+
+目标模型因方法而异；当前协议冻结的 Dense 目标见 `eval_protocol/README.md`。CSP / HARP 另支持 Mixtral-8x7B 与 OLMoE-1B-7B 的构建入口。
+
+## 故意不进 git 的内容
+
+实验产物、权重和结果 dump **不在仓库里**。`.gitignore` 已排除：
+
+- `/result/`、`/results/`
+- `**/experiments/`、`**/checkpoints/`
+- `*.pt`、`*.pth`、`outputs/`
+- 部分方法本地笔记（如 `NAPS/EXP_RESULTS.md`、`NAPS_v2/ITERATION_LOG.md`）
+
+新服务器需要自行准备：基座 checkpoint、六个（或八个）数据集本地副本、校准 cache、导出权重。见 [`eval_protocol/README.md`](eval_protocol/README.md) 与 `eval_protocol/env.example.sh`。
+
+## 最短上手
 
 ```bash
-evalscope eval \
- --model your-model-name \
- --api-url $OPENAI_API_BASE_URL \
- --api-key $OPENAI_API_KEY \
- --eval-type openai_api \
- --datasets gsm8k arc \
- --limit 5
+pip install -e .
+cp eval_protocol/env.example.sh eval_protocol/env.sh   # 填 PYTHON_BIN / MODEL_PATH / DATASET_ROOT
+source eval_protocol/env.sh
+bash eval_protocol/envs/gemma4-vllm-cu128/setup_gemma4_vllm_cu128.sh   # 新机器重建 serving env
+
+# 某方法导出 HF checkpoint 后：
+PROTOCOL=quick9 bash eval_protocol/run_vllm_protocol.sh <MODEL_ID> <API_BASE> <METHOD> <EXPERIMENT_DIR>
+WATCH_SECONDS=0 bash scripts/watch_eval_reports.sh
 ```
 
-### Method 2. Evaluate a Local Model
+方法侧的 profile / export 命令写在各目录 README，不在这里重复。
 
-Evaluate a local model (auto-downloaded from ModelScope):
+## 警告
 
-```bash
-evalscope eval \
- --model Qwen/Qwen2.5-0.5B-Instruct \
- --datasets gsm8k arc \
- --limit 5
-```
+- 含 **未发表方法**、内部实验设计与本机路径笔记。
+- 手册 / 脚本里仍有 `/data01/home/xinpei.gao/...` 一类绝对路径；移植时以 `eval_protocol/env.example.sh` 为准，不要照抄旧机器路径。
+- 仓库按设计为私有。不要把方法细节、未发表分数或内部手册同步到公开 fork / 社交媒体。
 
-### Method 3. Using Python Code
+## 上游 EvalScope
 
-```python
-from evalscope import run_task, TaskConfig
+- 上游：https://github.com/modelscope/evalscope
+- 通用用法、benchmark 列表与 Web dashboard 以 upstream 为准。本分叉在 MoE 方法与协议上 **ahead**，同时 **不跟踪** 上游全部产品功能（可能 behind 新 benchmark / service）。
+- 跑本仓库的剪枝实验：`pip install -e .`，再按 `eval_protocol/` 配环境。不要按上游营销 README 的 `pip install evalscope` 工作流，那不会带上根目录方法。
 
-task_cfg = TaskConfig(
-    model='your-model-name',
-    api_url='https://your-openai-compatible-endpoint/v1',
-    api_key='your_api_key',
-    eval_type='openai_api',
-    datasets=['gsm8k', 'arc'],
-    limit=5
-)
-
-run_task(task_cfg)
-```
-
-<details><summary><b>💡 Tip:</b> <code>run_task</code> also supports dictionaries, YAML or JSON files as configuration.</summary>
-
-**Using Python Dictionary**
-
-```python
-from evalscope.run import run_task
-
-task_cfg = {
-    'model': 'Qwen/Qwen2.5-0.5B-Instruct',
-    'datasets': ['gsm8k', 'arc'],
-    'limit': 5
-}
-run_task(task_cfg=task_cfg)
-```
-
-**Using YAML File** (`config.yaml`)
-```yaml
-model: Qwen/Qwen2.5-0.5B-Instruct
-datasets:
-  - gsm8k
-  - arc
-limit: 5
-```
-```python
-from evalscope.run import run_task
-
-run_task(task_cfg="config.yaml")
-```
-</details>
-
-### Output Results
-After evaluation completion, you will see a report in the terminal in the following format:
-```text
-+-----------------------+----------------+-----------------+-----------------+---------------+-------+---------+
-| Model Name            | Dataset Name   | Metric Name     | Category Name   | Subset Name   |   Num |   Score |
-+=======================+================+=================+=================+===============+=======+=========+
-| Qwen2.5-0.5B-Instruct | gsm8k          | AverageAccuracy | default         | main          |     5 |     0.4 |
-+-----------------------+----------------+-----------------+-----------------+---------------+-------+---------+
-| Qwen2.5-0.5B-Instruct | ai2_arc        | AverageAccuracy | default         | ARC-Easy      |     5 |     0.8 |
-+-----------------------+----------------+-----------------+-----------------+---------------+-------+---------+
-| Qwen2.5-0.5B-Instruct | ai2_arc        | AverageAccuracy | default         | ARC-Challenge |     5 |     0.4 |
-+-----------------------+----------------+-----------------+-----------------+---------------+-------+---------+
-```
-
-**Launch the visualization dashboard**:
-```bash
-pip install 'evalscope[service]'
-evalscope service
-```
-Visit `http://127.0.0.1:9000` to open the visualization interface.
-
-## 📈 Advanced Usage
-
-### Custom Evaluation Parameters
-
-You can fine-tune model loading, inference, and dataset configuration through command line parameters.
-
-```shell
-evalscope eval \
- --model Qwen/Qwen3-0.6B \
- --model-args '{"revision": "master", "precision": "torch.float16", "device_map": "auto"}' \
- --generation-config '{"do_sample":true,"temperature":0.6,"max_tokens":512}' \
- --dataset-args '{"gsm8k": {"few_shot_num": 0, "few_shot_random": false}}' \
- --datasets gsm8k \
- --limit 10
-```
-
-- `--model-args`: Model loading parameters such as `revision`, `precision`, etc.
-- `--generation-config`: Model generation parameters such as `temperature`, `max_tokens`, etc.
-- `--dataset-args`: Dataset configuration parameters such as `few_shot_num`, etc.
-
-For details, please refer to [📖 Complete Parameter Guide](https://evalscope.readthedocs.io/en/latest/get_started/parameters.html).
-
-### ⚔️ Arena Mode
-
-Arena mode evaluates model performance through pairwise battles between models, providing win rates and rankings, perfect for horizontal comparison of multiple models.
-
-```text
-# Example evaluation results
-Model           WinRate (%)  CI (%)
-------------  -------------  ---------------
-qwen2.5-72b            69.3  (-13.3 / +12.2)
-qwen2.5-7b             50    (+0.0 / +0.0)
-qwen2.5-0.5b            4.7  (-2.5 / +4.4)
-```
-For details, please refer to [📖 Arena Mode Usage Guide](https://evalscope.readthedocs.io/en/latest/user_guides/arena.html).
-
-### 🖊️ Custom Dataset Evaluation
-
-EvalScope allows you to easily add and evaluate your own datasets. For details, please refer to [📖 Custom Dataset Evaluation Guide](https://evalscope.readthedocs.io/en/latest/advanced_guides/custom_dataset/index.html).
-
-## ⚡ Inference Performance Evaluation Tool
-
-EvalScope provides a powerful stress testing tool for evaluating the performance of large language model services.
-
-- **Key Metrics**: Supports throughput (Tokens/s), first token latency (TTFT), token generation latency (TPOT), etc.
-- **Result Recording**: Supports recording results to `wandb` and `swanlab`.
-- **Speed Benchmarks**: Can generate speed benchmark results similar to official reports.
-
-For details, please refer to [📖 Performance Testing Usage Guide](https://evalscope.readthedocs.io/en/latest/user_guides/stress_test/index.html).
-
-<p align="center">
-    <img src="docs/en/user_guides/stress_test/images/multi_perf.png" style="width: 80%;">
-</p>
-
-## 🧪 Other Evaluation Backends
-EvalScope supports launching evaluation tasks through third-party evaluation frameworks (we call them "backends") to meet diverse evaluation needs.
-
-- **Native**: EvalScope's default evaluation framework with comprehensive functionality.
-- **OpenCompass**: Focuses on text-only evaluation. [📖 Usage Guide](https://evalscope.readthedocs.io/en/latest/user_guides/backend/opencompass_backend.html)
-- **VLMEvalKit**: Focuses on multi-modal evaluation. [📖 Usage Guide](https://evalscope.readthedocs.io/en/latest/user_guides/backend/vlmevalkit_backend.html)
-- **RAGEval**: Focuses on RAG evaluation, supporting Embedding and Reranker models. [📖 Usage Guide](https://evalscope.readthedocs.io/en/latest/user_guides/backend/rageval_backend/index.html)
-- **Third-party Evaluation Tools**: Supports evaluation tasks like [ToolBench](https://evalscope.readthedocs.io/en/latest/third_party/toolbench.html).
-
-<details><summary>🏛️ Overall Architecture</summary>
-
-<p align="center">
-    <img src="https://sail-moe.oss-cn-hangzhou.aliyuncs.com/yunlin/images/evalscope/doc/EvalScope%E6%9E%B6%E6%9E%84%E5%9B%BE.png" style="width: 70%;">
-    <br>EvalScope Overall Architecture.
-</p>
-
-1.  **Input Layer**
-    - **Model Sources**: API models (OpenAI API), Local models (ModelScope)
-    - **Datasets**: Standard evaluation benchmarks (MMLU/GSM8k etc.), Custom data (MCQ/QA)
-
-2.  **Core Functions**
-    - **Multi-backend Evaluation**: Native backend, OpenCompass, MTEB, VLMEvalKit, RAGAS
-    - **Performance Monitoring**: Supports multiple model service APIs and data formats, tracking TTFT/TPOP and other metrics
-    - **Tool Extensions**: Integrates Tool-Bench, Needle-in-a-Haystack, etc.
-
-3.  **Output Layer**
-    - **Structured Reports**: Supports JSON, Table, Logs
-    - **Visualization Platform**: Supports Web Dashboard, Wandb, SwanLab
-
-</details>
-
-
-## ❤️ Community & Support
-
-Welcome to join our community to communicate with other developers and get help.
-
-[Discord Group](https://discord.gg/xc66bMxc4h)              |  WeChat Group | DingTalk Group
-:-------------------------:|:-------------------------:|:-------------------------:
-<img src="docs/asset/discord_qr.png" width="160" height="160">  |  <img src="https://raw.githubusercontent.com/modelscope/ms-swift/main/asset/wechat.png" width="160" height="160"> | <img src="docs/asset/dingding.png" width="160" height="160">
-
-## 👷‍♂️ Contributing
-
-We welcome any contributions from the community! If you want to add new evaluation benchmarks, models, or features, please refer to our [Contributing Guide](https://evalscope.readthedocs.io/en/latest/advanced_guides/add_benchmark.html).
-
-Thanks to all developers who have contributed to EvalScope!
-
-<a href="https://github.com/modelscope/evalscope/graphs/contributors" target="_blank">
-  <table>
-    <tr>
-      <th colspan="2">
-        <br><img src="https://contrib.rocks/image?repo=modelscope/evalscope"><br><br>
-      </th>
-    </tr>
-  </table>
-</a>
-
-## 📚 Citation
-
-If you use EvalScope in your research, please cite our work:
-```bibtex
-@misc{evalscope_2024,
-    title={{EvalScope}: Evaluation Framework for Large Models},
-    author={ModelScope Team},
-    year={2024},
-    url={https://github.com/modelscope/evalscope}
-}
-```
-
-## ⭐ Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=modelscope/evalscope&type=Date)](https://star-history.com/#modelscope/evalscope&Date)
+中文指针：本文件即为主文档。[`README_zh.md`](README_zh.md) 只保留短说明，不再镜像上游 EvalScope 中文介绍。
